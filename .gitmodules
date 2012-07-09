@@ -2,3 +2,6 @@
 [submodule "BitergiaMetrics"]
 	path = BitergiaMetrics
 	url = ./BitergiaMetrics
+[submodule "AlluraBitergiaMetrics"]
+	path = AlluraBitergiaMetrics
+	url = https://github.com/Bitergia/AlluraBitergiaMetrics.git
