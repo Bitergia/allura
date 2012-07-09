@@ -1,1 +1,4 @@
 
+[submodule "BitergiaMetrics"]
+	path = BitergiaMetrics
+	url = ./BitergiaMetrics
