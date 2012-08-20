@@ -12,11 +12,10 @@ from collections import defaultdict
 
 import tg
 from paste.deploy.converters import asbool
-from pylons import c,g, request
+from pylons import c
 import pymongo.errors
 
 from ming import schema as S
-from ming.base import Object
 from ming.utils import LazyProperty
 from ming.orm import FieldProperty, session, Mapper
 from ming.orm.declarative import MappedClass
@@ -26,9 +25,10 @@ from allura.lib import utils
 
 from .artifact import Artifact, VersionedArtifact, Feed
 from .auth import User
-from .session import repository_orm_session, project_orm_session, main_doc_session
+from .session import repository_orm_session, project_orm_session
 from .notification import Notification
 from .repo_refresh import refresh_repo
+from .timeline import ActivityObject
 
 log = logging.getLogger(__name__)
 config = utils.ConfigProxy(
@@ -140,7 +140,7 @@ class RepositoryImplementation(object):
         os.chmod(magic_file, stat.S_IRUSR|stat.S_IRGRP|stat.S_IROTH)
         self._setup_hooks()
 
-class Repository(Artifact):
+class Repository(Artifact, ActivityObject):
     BATCH_SIZE=100
     class __mongometa__:
         name='generic-repository'
@@ -168,6 +168,10 @@ class Repository(Artifact):
             if 'url_path' not in kw:
                 kw['url_path'] = self.default_url_path(c.project, kw['tool'])
         super(Repository, self).__init__(**kw)
+
+    @property
+    def activity_name(self):
+        return 'repo %s' % self.name
 
     @classmethod
     def default_fs_path(cls, project, tool):
@@ -308,16 +312,21 @@ class Repository(Artifact):
 
     def refresh(self, all_commits=False, notify=True):
         '''Find any new commits in the repository and update'''
-        self._impl.refresh_heads()
-        if asbool(tg.config.get('scm.new_refresh')):
-            refresh_repo(self, all_commits, notify)
-            notify = False # don't double notify
-        self.status = 'ready'
-        for head in self.heads + self.branches + self.repo_tags:
-            ci = self.commit(head.object_id)
-            if ci is not None:
-                head.count = ci.count_revisions()
-        session(self).flush()
+        try:
+            log.info('... %r analyzing', self)
+            self.status = 'analyzing'
+            session(self).flush(self)
+            self._impl.refresh_heads()
+            if asbool(tg.config.get('scm.new_refresh')):
+                refresh_repo(self, all_commits, notify)
+            for head in self.heads + self.branches + self.repo_tags:
+                ci = self.commit(head.object_id)
+                if ci is not None:
+                    head.count = ci.count_revisions()
+        finally:
+            log.info('... %s ready', self)
+            self.status = 'ready'
+            session(self).flush(self)
 
     def push_upstream_context(self):
         project, rest=h.find_project(self.upstream_repo.name)
@@ -352,7 +361,7 @@ class Repository(Artifact):
     def forks(self):
         return self.query.find({'upstream_repo.name': self.url()}).all()
 
-class MergeRequest(VersionedArtifact):
+class MergeRequest(VersionedArtifact, ActivityObject):
     statuses=['open', 'merged', 'rejected']
     class __mongometa__:
         name='merge-request'
@@ -371,6 +380,10 @@ class MergeRequest(VersionedArtifact):
     created=FieldProperty(datetime, if_missing=datetime.utcnow)
     summary=FieldProperty(str)
     description=FieldProperty(str)
+
+    @property
+    def activity_name(self):
+        return 'merge request #%s' % self.request_number
 
     @LazyProperty
     def creator(self):

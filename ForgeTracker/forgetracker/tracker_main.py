@@ -26,7 +26,8 @@ from allura.lib import helpers as h
 from allura.app import Application, SitemapEntry, DefaultAdminController, ConfigOption
 from allura.lib.search import search_artifact
 from allura.lib.decorators import require_post
-from allura.lib.security import require_access, has_access, require
+from allura.lib.security import (require_access, has_access, require,
+                                 require_authenticated)
 from allura.lib import widgets as w
 from allura.lib import validators as V
 from allura.lib.widgets import form_fields as ffw
@@ -62,6 +63,12 @@ def _mongo_col_to_solr_col(name):
         return 'ticket_num_i'
     elif name == 'summary':
         return 'snippet_s'
+    elif name == 'votes':
+        return 'votes_total_i'
+    elif name == 'votes_up':
+        return 'votes_up_i'
+    elif name == 'votes_down':
+        return 'votes_down_i'
     elif name == '_milestone':
         return '_milestone_s'
     elif name == 'status':
@@ -97,12 +104,14 @@ class W:
     ticket_custom_field = TicketCustomField
     options_admin = OptionsAdmin()
     search_help_modal = SearchHelp()
+    vote_form = w.VoteForm()
 
 class ForgeTrackerApp(Application):
     __version__ = version.__version__
-    permissions = ['configure', 'read', 'write', 'save_searches',
+    permissions = ['configure', 'read', 'update', 'create', 'save_searches',
                     'unmoderated_post', 'post', 'moderate', 'admin']
     config_options = Application.config_options + [
+        ConfigOption('EnableVoting', bool, False),
         ConfigOption('TicketMonitoringEmail', str, ''),
         ConfigOption('TicketMonitoringType',
             schema.OneOf('NewTicketsOnly', 'AllTicketChanges'), None)
@@ -174,7 +183,6 @@ class ForgeTrackerApp(Application):
     def sidebar_menu(self):
         search_bins = []
         milestones = []
-        ticket = request.path_info.split(self.url)[-1].split('/')[0]
         for bin in self.bins:
             label = bin.shorthand_id()
             search_bins.append(SitemapEntry(
@@ -188,13 +196,9 @@ class ForgeTrackerApp(Application):
                         h.text.truncate(m.name, 72),
                         self.url + fld.name[1:] + '/' + h.urlquote(m.name) + '/',
                         small=c.app.globals.milestone_count('%s:%s' % (fld.name, m.name))['hits']))
-        if ticket.isdigit():
-            ticket = TM.Ticket.query.find(dict(app_config_id=self.config._id,ticket_num=int(ticket))).first()
-        else:
-            ticket = None
 
         links = []
-        if has_access(self, 'write')():
+        if has_access(self, 'create')():
             links.append(SitemapEntry('Create Ticket',
                 self.config.url() + 'new/', ui_icon=g.icons['plus']))
         if has_access(self, 'configure')():
@@ -206,17 +210,6 @@ class ForgeTrackerApp(Application):
         if pending_mod_count and has_access(discussion, 'moderate')():
             links.append(SitemapEntry('Moderate', discussion.url() + 'moderate', ui_icon=g.icons['pencil'],
                 small = pending_mod_count))
-        if ticket:
-            if ticket.super_id:
-                links.append(SitemapEntry('Supertask'))
-                super = TM.Ticket.query.get(_id=ticket.super_id, app_config_id=c.app.config._id)
-                links.append(SitemapEntry('[#{0}]'.format(super.ticket_num), super.url()))
-            if ticket.sub_ids:
-                links.append(SitemapEntry('Subtasks'))
-            for sub_id in ticket.sub_ids or []:
-                sub = TM.Ticket.query.get(_id=sub_id, app_config_id=c.app.config._id)
-                links.append(SitemapEntry('[#{0}]'.format(sub.ticket_num), sub.url()))
-            #links.append(SitemapEntry('Create New Subtask', '{0}new/?super_id={1}'.format(self.config.url(), ticket._id)))
 
         links += milestones
 
@@ -264,7 +257,8 @@ class ForgeTrackerApp(Application):
             M.ACE.allow(role_anon, 'read'),
             M.ACE.allow(role_auth, 'post'),
             M.ACE.allow(role_auth, 'unmoderated_post'),
-            M.ACE.allow(role_developer, 'write'),
+            M.ACE.allow(role_developer, 'update'),
+            M.ACE.allow(role_developer, 'create'),
             M.ACE.allow(role_developer, 'moderate'),
             M.ACE.allow(role_developer, 'save_searches'),
             M.ACE.allow(role_admin, 'configure'),
@@ -304,6 +298,37 @@ class ForgeTrackerApp(Application):
     def bins(self):
         return TM.Bin.query.find(dict(app_config_id=self.config._id)).sort('summary').all()
 
+
+
+
+
+### Controllers ###
+
+def mongo_columns():
+    columns = [dict(name='ticket_num', sort_name='ticket_num', label='Ticket Number', active=True),
+               dict(name='summary', sort_name='summary', label='Summary', active=True),
+               dict(name='_milestone', sort_name='custom_fields._milestone', label='Milestone', active=True),
+               dict(name='status', sort_name='status', label='Status', active=True),
+               dict(name='assigned_to', sort_name='assigned_to_username', label='Owner', active=True)]
+    for field in c.app.globals.sortable_custom_fields_shown_in_search():
+        columns.append(
+            dict(name=field['name'], sort_name=field['name'], label=field['label'], active=True))
+    if c.app.config.options.get('EnableVoting'):
+        columns.append(dict(name='votes', sort_name='votes', label='Votes', active=True))
+    return columns
+
+def solr_columns():
+    columns = [dict(name='ticket_num', sort_name='ticket_num_i', label='Ticket Number', active=True),
+               dict(name='summary', sort_name='snippet_s', label='Summary', active=True),
+               dict(name='_milestone', sort_name='_milestone_s', label='Milestone', active=True),
+               dict(name='status', sort_name='status_s', label='Status', active=True),
+               dict(name='assigned_to', sort_name='assigned_to_s', label='Owner', active=True)]
+    for field in c.app.globals.sortable_custom_fields_shown_in_search():
+        columns.append(dict(name=field['name'], sort_name=field['sortable_name'], label=field['label'], active=True))
+    if c.app.config.options.get('EnableVoting'):
+        columns.append(dict(name='votes', sort_name='votes_total_i', label='Votes', active=True))
+    return columns
+
 class RootController(BaseController):
 
     def __init__(self):
@@ -329,86 +354,19 @@ class RootController(BaseController):
             bin_counts.append(dict(label=label, count=count))
         return dict(bin_counts=bin_counts)
 
-    def paged_query(self, q, limit=None, page=0, sort=None, columns=None, **kw):
-        """Query tickets, sorting and paginating the result.
-
-        We do the sorting and skipping right in SOLR, before we ever ask
-        Mongo for the actual tickets.  Other keywords for
-        search_artifact (e.g., history) or for SOLR are accepted through
-        kw.  The output is intended to be used directly in templates,
-        e.g., exposed controller methods can just:
-
-            return paged_query(q, ...)
-
-        If you want all the results at once instead of paged you have
-        these options:
-          - don't call this routine, search directly in mongo
-          - call this routine with a very high limit and TEST that
-            count<=limit in the result
-        limit=-1 is NOT recognized as 'all'.  500 is a reasonable limit.
-        """
-
-        limit, page, start = g.handle_paging(limit, page, default=25)
-        count = 0
-        tickets = []
-        refined_sort = sort if sort else 'ticket_num_i asc'
-        if  'ticket_num_i' not in refined_sort:
-            refined_sort += ',ticket_num_i asc'
-        try:
-            if q:
-                matches = search_artifact(
-                    TM.Ticket, q,
-                    rows=limit, sort=refined_sort, start=start, fl='ticket_num_i', **kw)
-            else:
-                matches = None
-            solr_error = None
-        except ValueError, e:
-            solr_error = e.args[0]
-            matches = []
-        if matches:
-            count = matches.hits
-            # ticket_numbers is in sorted order
-            ticket_numbers = [match['ticket_num_i'] for match in matches.docs]
-            # but query, unfortunately, returns results in arbitrary order
-            query = TM.Ticket.query.find(dict(app_config_id=c.app.config._id, ticket_num={'$in':ticket_numbers}))
-            # so stick all the results in a dictionary...
-            ticket_for_num = {}
-            for t in query:
-                ticket_for_num[t.ticket_num] = t
-            # and pull them out in the order given by ticket_numbers
-            tickets = []
-            for tn in ticket_numbers:
-                if tn in ticket_for_num:
-                    if has_access(ticket_for_num[tn], 'read'):
-                        tickets.append(ticket_for_num[tn])
-                    else:
-                        count = count -1
-        sortable_custom_fields=c.app.globals.sortable_custom_fields_shown_in_search()
-        if not columns:
-            columns = [dict(name='ticket_num', sort_name='ticket_num_i', label='Ticket Number', active=True),
-                       dict(name='summary', sort_name='snippet_s', label='Summary', active=True),
-                       dict(name='_milestone', sort_name='_milestone_s', label='Milestone', active=True),
-                       dict(name='status', sort_name='status_s', label='Status', active=True),
-                       dict(name='assigned_to', sort_name='assigned_to_s', label='Owner', active=True)]
-            for field in sortable_custom_fields:
-                columns.append(dict(name=field['name'], sort_name=field['sortable_name'], label=field['label'], active=True))
-        return dict(tickets=tickets,
-                    sortable_custom_fields=sortable_custom_fields,
-                    columns=columns,
-                    count=count, q=q, limit=limit, page=page, sort=sort,
-                    solr_error=solr_error, **kw)
-
     @with_trailing_slash
     @h.vardec
     @expose('jinja:forgetracker:templates/tracker/index.html')
     def index(self, limit=25, columns=None, page=0, sort='ticket_num desc', **kw):
         kw.pop('q', None) # it's just our original query mangled and sent back to us
-        result = TM.Ticket.paged_query(c.app.globals.not_closed_mongo_query,
+        result = TM.Ticket.paged_query(c.app.config, c.user,
+                                        c.app.globals.not_closed_mongo_query,
                                         sort=sort, limit=int(limit),
-                                        columns=columns, page=page, **kw)
-        c.subscribe_form = W.subscribe_form
+                                        page=page, **kw)
+        result['columns'] = columns or mongo_columns()
+        result['sortable_custom_fields'] = c.app.globals.sortable_custom_fields_shown_in_search()
         result['subscribed'] = M.Mailbox.subscribed()
-        result['allow_edit'] = has_access(c.app, 'write')()
+        result['allow_edit'] = has_access(c.app, 'update')()
         result['help_msg'] = c.app.config.options.get('TicketHelpSearch')
         result['url_q'] = c.app.globals.not_closed_query
         result['url_sort'] = ''
@@ -416,6 +374,7 @@ class RootController(BaseController):
             sort_split = sort.split(' ')
             solr_col = _mongo_col_to_solr_col(sort_split[0])
             result['url_sort'] = '%s %s' % (solr_col, sort_split[1])
+        c.subscribe_form = W.subscribe_form
         c.ticket_search_results = W.ticket_search_results
         return result
 
@@ -504,8 +463,10 @@ class RootController(BaseController):
             bin = TM.Bin.query.find(dict(app_config_id=c.app.config._id,terms=q)).first()
         if project:
             redirect(c.project.url() + 'search?' + urlencode(dict(q=q, history=kw.get('history'))))
-        result = self.paged_query(q, page=page, sort=sort, columns=columns, **kw)
-        result['allow_edit'] = has_access(c.app, 'write')()
+        result = TM.Ticket.paged_search(c.app.config, c.user, q, page=page, sort=sort, **kw)
+        result['columns'] = columns or solr_columns()
+        result['sortable_custom_fields'] = c.app.globals.sortable_custom_fields_shown_in_search()
+        result['allow_edit'] = has_access(c.app, 'update')()
         result['bin'] = bin
         result['help_msg'] = c.app.config.options.get('TicketHelpSearch')
         c.ticket_search_results = W.ticket_search_results
@@ -515,23 +476,24 @@ class RootController(BaseController):
     @h.vardec
     @expose()
     @validate(validators=search_validators)
-    def search_feed(self, q=None, query=None, project=None, columns=None, page=0, sort=None, **kw):
+    def search_feed(self, q=None, query=None, project=None, page=0, sort=None, **kw):
         if query and not q:
             q = query
-        result = self.paged_query(q, page=page, sort=sort, columns=columns, **kw)
+        result = TM.Ticket.paged_search(c.app.config, c.user, q, page=page, sort=sort, **kw)
         response.headers['Content-Type'] = ''
         response.content_type = 'application/xml'
-        d = dict(title='Ticket search results', link=c.app.url, description='You searched for %s' % q, language=u'en')
+        d = dict(title='Ticket search results', link=h.absurl(c.app.url), description='You searched for %s' % q, language=u'en')
         if request.environ['PATH_INFO'].endswith('.atom'):
             feed = FG.Atom1Feed(**d)
         else:
             feed = FG.Rss201rev2Feed(**d)
         for t in result['tickets']:
+            url = h.absurl(t.url().encode('utf-8'))
             feed.add_item(title=t.summary,
-                          link=h.absurl(t.url().encode('utf-8')),
+                          link=url,
                           pubdate=t.mod_date,
                           description=t.description,
-                          unique_id=str(t._id),
+                          unique_id=url,
                           author_name=t.reported_by.display_name,
                           author_link=h.absurl(t.reported_by.url()))
         return feed.writeString('utf-8')
@@ -547,12 +509,12 @@ class RootController(BaseController):
 
     @with_trailing_slash
     @expose('jinja:forgetracker:templates/tracker/new_ticket.html')
-    def new(self, super_id=None, description=None, summary=None, labels=None, **kw):
-        require_access(c.app, 'write')
+    def new(self, description=None, summary=None, labels=None, **kw):
+        require_access(c.app, 'create')
         c.ticket_form = W.ticket_form
         help_msg = c.app.config.options.get('TicketHelpNew')
         return dict(action=c.app.config.url()+'save_ticket',
-                    super_id=super_id, help_msg=help_msg,
+                    help_msg=help_msg,
                     description=description, summary=summary, labels=labels)
 
     @expose('jinja:allura:templates/markdown_syntax.html')
@@ -604,11 +566,13 @@ class RootController(BaseController):
                 ticket_num=ticket_num)
             if not ticket:
                 raise Exception('Ticket number not found.')
-            require_access(ticket, 'write')
+            require_access(ticket, 'update')
         else:
-            require_access(c.app, 'write')
+            require_access(c.app, 'create')
             ticket = TM.Ticket.new()
         ticket.update(ticket_form)
+        g.director.create_activity(c.user, 'created', ticket,
+                related_nodes=[c.project])
         redirect(str(ticket.ticket_num)+'/')
 
     @with_trailing_slash
@@ -618,10 +582,12 @@ class RootController(BaseController):
                    page=validators.Int(if_empty=0),
                    sort=validators.UnicodeString(if_empty='ticket_num_i asc')))
     def edit(self, q=None, limit=None, page=None, sort=None, **kw):
-        require_access(c.app, 'write')
-        result = self.paged_query(q, sort=sort, limit=limit, page=page, **kw)
+        require_access(c.app, 'update')
+        result = TM.Ticket.paged_search(c.app.config, c.user, q, sort=sort, limit=limit, page=page, **kw)
         # if c.app.globals.milestone_names is None:
         #     c.app.globals.milestone_names = ''
+        result['columns'] = solr_columns()
+        result['sortable_custom_fields'] = c.app.globals.sortable_custom_fields_shown_in_search()
         result['globals'] = c.app.globals
         result['cancel_href'] = url(
             c.app.url + 'search/',
@@ -639,7 +605,7 @@ class RootController(BaseController):
                 _id={'$in':[ObjectId(id) for id in post_data['selected'].split(',')]},
                 app_config_id=c.app.config._id)).all()
         for ticket in tickets:
-            require_access(ticket, 'write')
+            require_access(ticket, 'update')
 
         fields = set(['status'])
         values = {}
@@ -1009,6 +975,7 @@ class TicketController(BaseController):
             c.attachment_list = W.attachment_list
             c.subscribe_form = W.ticket_subscribe_form
             c.ticket_custom_field = W.ticket_custom_field
+            c.vote_form = W.vote_form
             tool_subscribed = M.Mailbox.subscribed()
             if tool_subscribed:
                 subscribed = False
@@ -1016,10 +983,11 @@ class TicketController(BaseController):
                 subscribed = M.Mailbox.subscribed(artifact=self.ticket)
             post_count = self.ticket.discussion_thread.post_count
             limit, page = h.paging_sanitizer(limit, page, post_count)
+            voting_enabled = self.ticket.app.config.options.get('EnableVoting')
             return dict(ticket=self.ticket, globals=c.app.globals,
-                        allow_edit=has_access(self.ticket, 'write')(),
+                        allow_edit=has_access(self.ticket, 'update')(),
                         tool_subscribed=tool_subscribed,
-                        subscribed=subscribed,
+                        subscribed=subscribed, voting_enabled=voting_enabled,
                         page=page, limit=limit, count=post_count)
         else:
             raise exc.HTTPNotFound, 'Ticket #%s does not exist.' % self.ticket_num
@@ -1078,7 +1046,7 @@ class TicketController(BaseController):
 
     @require_post()
     def _update_ticket(self, post_data):
-        require_access(self.ticket, 'write')
+        require_access(self.ticket, 'update')
         changes = changelog()
         comment = post_data.pop('comment', None)
         labels = post_data.pop('labels', None) or []
@@ -1107,17 +1075,10 @@ class TicketController(BaseController):
             if hasattr(attachment, 'file'):
                 self.ticket.attach(
                     attachment.filename, attachment.file, content_type=attachment.type)
-        any_sums = False
         for cf in c.app.globals.custom_fields or []:
             if 'custom_fields.' + cf.name in post_data:
                 value = post_data['custom_fields.' + cf.name]
-                if cf.type == 'sum':
-                    any_sums = True
-                    try:
-                        value = float(value)
-                    except (TypeError, ValueError):
-                        value = 0
-                elif cf.type == 'user':
+                if cf.type == 'user':
                     # restrict custom user field values to project members
                     user = c.project.user_in_project(value)
                     value = user.username \
@@ -1156,22 +1117,14 @@ class TicketController(BaseController):
             changelist=changes.get_changed())
         if post is None:
             post = thread.add_post(text=change_text)
-            monitoring_email = c.app.config.options.get('TicketMonitoringEmail')
-            monitoring_type = c.app.config.options.get('TicketMonitoringType')
-            if monitoring_email and monitoring_type == 'AllTicketChanges':
-                artifact = post.thread.artifact or post.thread
-                n = M.Notification.query.get(_id=artifact.url() + post._id)
-                if not n:
-                    n = M.Notification._make_notification(artifact, 'message',
-                                                          post=post)
-                n.send_simple(monitoring_email)
         else:
             post.text += '\n\n' + change_text
+            post.notify(check_dup=True)
         self.ticket.commit()
-        if any_sums:
-            self.ticket.dirty_sums()
         if comment:
             self.ticket.discussion_thread.post(text=comment)
+        g.director.create_activity(c.user, 'modified', self.ticket,
+                related_nodes=[c.project])
         redirect('.')
 
     @expose()
@@ -1183,9 +1136,28 @@ class TicketController(BaseController):
             self.ticket.unsubscribe()
         redirect(request.referer)
 
+    @expose('json:')
+    @require_post()
+    def vote(self, vote):
+        require_authenticated()
+        require_access(self.ticket, 'post')
+        status = 'ok'
+        if vote == 'u':
+            self.ticket.vote_up(c.user)
+        elif vote == 'd':
+            self.ticket.vote_down(c.user)
+        else:
+            status = 'error'
+        return dict(
+            status=status,
+            votes_up=self.ticket.votes_up,
+            votes_down=self.ticket.votes_down,
+            votes_percent=self.ticket.votes_up_percent)
+
+
 class AttachmentController(ac.AttachmentController):
     AttachmentClass = TM.TicketAttachment
-    edit_perm = 'write'
+    edit_perm = 'update'
 
 class AttachmentsController(ac.AttachmentsController):
     AttachmentControllerClass = AttachmentController
@@ -1217,6 +1189,7 @@ class TrackerAdminController(DefaultAdminController):
     def options(self, **kw):
         c.options_admin = W.options_admin
         return dict(app=self.app, form_value=dict(
+            EnableVoting=self.app.config.options.get('EnableVoting'),
             TicketMonitoringType=self.app.config.options.get('TicketMonitoringType'),
             TicketMonitoringEmail=self.app.config.options.get('TicketMonitoringEmail'),
             TicketHelpNew=self.app.config.options.get('TicketHelpNew'),
@@ -1335,17 +1308,21 @@ class RootRestController(BaseController):
         require_access(c.app, 'read')
 
     @expose('json:')
-    def index(self, **kw):
-        return dict(tickets=[
-            dict(ticket_num=t.ticket_num, summary=t.summary)
-            for t in TM.Ticket.query.find(dict(app_config_id=c.app.config._id)).sort('ticket_num') ])
+    def index(self, limit=100, page=0, **kw):
+        results = TM.Ticket.paged_query(c.app.config, c.user, query={},
+                                        limit=int(limit), page=int(page))
+        results['tickets'] = [dict(ticket_num=t.ticket_num, summary=t.summary)
+                              for t in results['tickets']]
+        results.pop('q', None)
+        results.pop('sort', None)
+        return results
 
     @expose()
     @h.vardec
     @require_post()
     @validate(W.ticket_form, error_handler=h.json_validation_error)
     def new(self, ticket_form=None, **post_data):
-        require_access(c.app, 'write')
+        require_access(c.app, 'create')
         c.app.globals.invalidate_bin_counts()
         if c.app.globals.milestone_names is None:
             c.app.globals.milestone_names = ''
@@ -1382,6 +1359,13 @@ class RootRestController(BaseController):
             log.exception(e)
             return dict(status=False, errors=[str(e)])
 
+    @expose('json:')
+    def search(self, q=None, limit=100, page=0, sort=None, **kw):
+        results = TM.Ticket.paged_search(c.app.config, c.user, q, limit, page, sort)
+        results['tickets'] = [dict(ticket_num=t.ticket_num, summary=t.summary)
+                              for t in results['tickets']]
+        return results
+
     @expose()
     def _lookup(self, ticket_num, *remainder):
         return TicketRestController(ticket_num), remainder
@@ -1408,7 +1392,7 @@ class TicketRestController(BaseController):
     @require_post()
     @validate(W.ticket_form, error_handler=h.json_validation_error)
     def save(self, ticket_form=None, **post_data):
-        require_access(self.ticket, 'write')
+        require_access(self.ticket, 'update')
         c.app.globals.invalidate_bin_counts()
         # if c.app.globals.milestone_names is None:
         #     c.app.globals.milestone_names = ''
@@ -1419,11 +1403,14 @@ class MilestoneController(BaseController):
 
     def __init__(self, root, field, milestone):
         for fld in c.app.globals.milestone_fields:
-            if fld.name[1:] == field: break
+            name_no_underscore = fld.name[1:]
+            if fld.name[1:] == field:
+                break
         else:
             raise exc.HTTPNotFound()
         for m in fld.milestones:
-            if m.name == unquote(milestone): break
+            if m.name == unquote(milestone).decode('utf-8'):
+                break
         else:
             raise exc.HTTPNotFound()
         self.root = root
@@ -1442,9 +1429,11 @@ class MilestoneController(BaseController):
             sort=validators.UnicodeString(if_empty=None)))
     def index(self, q=None, columns=None, page=0, query=None, sort=None, **kw):
         require(has_access(c.app, 'read'))
-        result = TM.Ticket.paged_query(
-            self.mongo_query, page=page, sort=sort, columns=columns, **kw)
-        result['allow_edit'] = has_access(c.app, 'write')()
+        result = TM.Ticket.paged_query(c.app.config, c.user,
+            self.mongo_query, page=page, sort=sort, **kw)
+        result['columns'] = columns or mongo_columns()
+        result['sortable_custom_fields'] = c.app.globals.sortable_custom_fields_shown_in_search()
+        result['allow_edit'] = has_access(c.app, 'update')()
         result['help_msg'] = c.app.config.options.get('TicketHelpSearch')
         progress = c.app.globals.milestone_count(self.progress_key)
         result.pop('q')
@@ -1470,9 +1459,11 @@ class MilestoneController(BaseController):
                    page=validators.Int(if_empty=0),
                    sort=validators.UnicodeString(if_empty='ticket_num_i asc')))
     def edit(self, q=None, limit=None, page=None, sort=None, columns=None, **kw):
-        require_access(c.app, 'write')
-        result = TM.Ticket.paged_query(
-            self.mongo_query, page=page, sort=sort, columns=columns, **kw)
+        require_access(c.app, 'update')
+        result = TM.Ticket.paged_query(c.app.config, c.user,
+            self.mongo_query, page=page, sort=sort, **kw)
+        result['columns'] = columns or mongo_columns()
+        result['sortable_custom_fields'] = c.app.globals.sortable_custom_fields_shown_in_search()
         # if c.app.globals.milestone_names is None:
         #     c.app.globals.milestone_names = ''
         result.pop('q')
@@ -1491,7 +1482,7 @@ class MilestoneController(BaseController):
                 _id={'$in':[ObjectId(id) for id in post_data['selected'].split(',')]},
                 app_config_id=c.app.config._id)).all()
         for ticket in tickets:
-            require_access(ticket, 'write')
+            require_access(ticket, 'update')
 
         fields = set(['status'])
         values = {}

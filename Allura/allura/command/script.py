@@ -1,6 +1,7 @@
 import sys
 import os.path
 import cProfile
+import warnings
 
 from pylons import c
 import pylons
@@ -23,20 +24,27 @@ class ScriptCommand(base.Command):
                       help='Drop to a debugger on error')
 
     def command(self):
-        self.basic_setup()
-        request = webob.Request.blank('--script--', environ={
-                'paste.registry':self.registry})
-        self.registry.register(pylons.request, request)
-        if self.options.pdb:
-            base.log.info('Installing exception hook')
-            sys.excepthook = utils.postmortem_hook
-        with open(self.args[1]) as fp:
-            ns = dict(__name__='__main__')
-            sys.argv = self.args[1:]
-            if self.options.profile:
-                cProfile.run(fp, '%s.profile' % os.path.basename(self.args[1]))
+        with warnings.catch_warnings():
+            try:
+                from sqlalchemy import exc
+            except ImportError:
+                pass
             else:
-                exec fp in ns
+                warnings.simplefilter("ignore", category=exc.SAWarning)
+            self.basic_setup()
+            request = webob.Request.blank('--script--', environ={
+                    'paste.registry':self.registry})
+            self.registry.register(pylons.request, request)
+            if self.options.pdb:
+                base.log.info('Installing exception hook')
+                sys.excepthook = utils.postmortem_hook
+            with open(self.args[1]) as fp:
+                ns = dict(__name__='__main__')
+                sys.argv = self.args[1:]
+                if self.options.profile:
+                    cProfile.run(fp, '%s.profile' % os.path.basename(self.args[1]))
+                else:
+                    exec fp in ns
 
 class SetToolAccessCommand(base.Command):
     min_args=3

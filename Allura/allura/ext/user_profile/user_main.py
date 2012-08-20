@@ -1,18 +1,17 @@
-import os
 import logging
 from pprint import pformat
 
 import pkg_resources
-from pylons import c, request
+from pylons import c, g, request
 from formencode import validators
 from tg import expose, redirect, validate, response
 
 from allura import version
-from allura.app import Application, WidgetController, SitemapEntry
+from allura.app import Application, WidgetController
 from allura.lib import helpers as h
 from allura.lib.helpers import DateTimeConverter
 from allura.ext.project_home import model as M
-from allura.lib.security import require, has_access, require_access
+from allura.lib.security import require_access
 from allura.model import User, Notification, ACE
 from allura.controllers import BaseController
 from allura.lib.decorators import require_post
@@ -48,10 +47,6 @@ class UserProfileApp(Application):
     def sitemap(self):
         return []
 
-    @h.exceptionless([], log)
-    def sidebar_menu(self):
-        return [ SitemapEntry('Preferences', '/auth/prefs/')]
-
     def admin_menu(self):
         return []
 
@@ -73,9 +68,7 @@ class UserProfileController(BaseController):
 
     @expose('jinja:allura.ext.user_profile:templates/user_index.html')
     def index(self, **kw):
-        username = c.project.shortname.split('/')[1]
-        user = User.by_username(username)
-        return dict(user=user)
+        return dict(user=c.project.user_project_of)
     # This will be fully implemented in a future iteration
     # @expose('jinja:allura.ext.user_profile:templates/user_subscriptions.html')
     # def subscriptions(self):
@@ -90,9 +83,7 @@ class UserProfileController(BaseController):
 
     @expose('jinja:allura.ext.user_profile:templates/user_dashboard_configuration.html')
     def configuration(self):
-        username = c.project.shortname.split('/')[1]
-        user = User.by_username(username)
-        return dict(user=user)
+        return dict(user=c.project.user_project_of)
 
     @expose()
     @validate(dict(
@@ -101,8 +92,7 @@ class UserProfileController(BaseController):
             page=validators.Int(if_empty=None),
             limit=validators.Int(if_empty=None)))
     def feed(self, since=None, until=None, page=None, limit=None):
-        username = c.project.shortname.split('/')[1]
-        user = User.by_username(username)
+        user = c.project.user_project_of
         if request.environ['PATH_INFO'].endswith('.atom'):
             feed_type = 'atom'
         else:

@@ -22,6 +22,8 @@ log = logging.getLogger(__name__)
 class NeighborhoodFile(File):
     class __mongometa__:
         session = main_orm_session
+        indexes = [ 'neighborhood_id' ]
+
     neighborhood_id = FieldProperty(S.ObjectId)
 
 re_picker_css_type = re.compile('^/\*(.+)\*/')
@@ -111,7 +113,8 @@ class Neighborhood(MappedClass):
 
     @property
     def has_home_tool(self):
-        return self.neighborhood_project.app_config('home') is not None
+        return (self.neighborhood_project
+                    .app_config_by_tool_type('home') is not None)
 
     @property
     def icon(self):

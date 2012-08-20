@@ -1,3 +1,4 @@
+import re
 import os
 import shutil
 import string
@@ -20,7 +21,6 @@ from ming.base import Object
 from ming.orm import Mapper, FieldProperty, session
 from ming.utils import LazyProperty
 
-import allura.tasks
 from allura import model as M
 from allura.lib import helpers as h
 from allura.model.repository import GitLikeTree
@@ -68,17 +68,7 @@ class Repository(M.Repository):
     def latest(self, branch=None):
         if self._impl is None: return None
         if not self.heads: return None
-        last_id = self.heads[0].object_id
-        # check the latest revision on the real repo because sometimes the refresh gets stuck
-        info = self._impl._svn.info2(
-            self._impl._url,
-            revision=pysvn.Revision(pysvn.opt_revision_kind.head),
-            recurse=False)[0][1]
-        if info.rev.number > int(last_id.split(':')[1]):
-            last_id = self._impl._oid(info.rev.number)
-            # the repo is in a bad state, run a refresh
-            allura.tasks.repo_tasks.refresh.post()
-        return self._impl.commit(last_id)
+        return self._impl.commit(self.heads[0].object_id)
 
 
 class SVNCalledProcessError(Exception):
@@ -149,10 +139,6 @@ class SVNImplementation(M.RepositoryImplementation):
     def clone_from(self, source_url):
         '''Initialize a repo as a clone of another using svnsync'''
         self.init(default_dirs=False, skip_special_files=True)
-        self._repo.status = 'importing'
-        session(self._repo).flush()
-        log.info('Initialize %r as a clone of %s',
-                 self._repo, source_url)
         # Need a pre-revprop-change hook for cloning
         fn = os.path.join(self._repo.fs_path, self._repo.name,
                           'hooks', 'pre-revprop-change')
@@ -164,17 +150,18 @@ class SVNImplementation(M.RepositoryImplementation):
             p = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
             stdout, stderr = p.communicate(input='p\n')
             if p.returncode != 0:
+                self._repo.status = 'ready'
+                session(self._repo).flush(self._repo)
                 raise SVNCalledProcessError(cmd, p.returncode, stdout, stderr)
 
+        self._repo.status = 'importing'
+        session(self._repo).flush(self._repo)
+        log.info('Initialize %r as a clone of %s',
+                 self._repo, source_url)
         check_call(['svnsync', 'init', self._url, source_url])
         check_call(['svnsync', '--non-interactive', 'sync', self._url])
-        self._repo.status = 'analyzing'
-        session(self._repo).flush()
-        log.info('... %r cloned, analyzing', self._repo)
+        log.info('... %r cloned', self._repo)
         self._repo.refresh(notify=False)
-        self._repo.status = 'ready'
-        log.info('... %s ready', self._repo)
-        session(self._repo).flush()
         self._setup_special_files()
 
     def refresh_heads(self):
@@ -187,7 +174,7 @@ class SVNImplementation(M.RepositoryImplementation):
         # Branches and tags aren't really supported in subversion
         self._repo.branches = []
         self._repo.repo_tags = []
-        session(self._repo).flush()
+        session(self._repo).flush(self._repo)
 
     def commit(self, rev):
         if rev in ('HEAD', None):
@@ -203,6 +190,13 @@ class SVNImplementation(M.RepositoryImplementation):
         return result
 
     def all_commit_ids(self):
+        """Return a list of commit ids, starting with the root (first commit)
+        and ending with the most recent commit.
+
+        NB: The ForgeGit implementation returns commits in the opposite order.
+        """
+        if not self._repo.heads:
+            return []
         head_revno = self._revno(self._repo.heads[0].object_id)
         return map(self._oid, range(1, head_revno+1))
 
@@ -272,14 +266,23 @@ class SVNImplementation(M.RepositoryImplementation):
         di = DiffInfoDoc.make(dict(_id=ci_doc._id, differences=[]))
         for path in log_entry.changed_paths:
             if path.action in ('A', 'M', 'R'):
-                rhs_info = self._svn.info2(
-                    self._url + h.really_unicode(path.path),
-                    revision=self._revision(ci_doc._id),
-                    recurse=False)[0][1]
-                rhs_id = self._obj_oid(ci_doc._id, rhs_info)
+                try:
+                    rhs_info = self._svn.info2(
+                        self._url + h.really_unicode(path.path),
+                        revision=self._revision(ci_doc._id),
+                        recurse=False)[0][1]
+                    rhs_id = self._obj_oid(ci_doc._id, rhs_info)
+                except pysvn.ClientError, e:
+                    # pysvn will sometimes misreport deleted files (D) as
+                    # something else (like A), causing info2() to raise a
+                    # ClientError since the file doesn't exist in this
+                    # revision. Set lrhs_id = None to treat like a deleted file
+                    log.info('This error was handled gracefully and logged '
+                             'for informational purposes only:\n' + str(e))
+                    rhs_id = None
             else:
                 rhs_id = None
-            if path.action in ('D', 'M', 'R'):
+            if ci_doc.parent_ids and path.action in ('D', 'M', 'R'):
                 try:
                     lhs_info = self._svn.info2(
                         self._url + h.really_unicode(path.path),
@@ -291,7 +294,8 @@ class SVNImplementation(M.RepositoryImplementation):
                     # causing info2() to raise ClientError since the file
                     # doesn't exist in the parent revision. Set lhs_id = None
                     # to treat like a newly added file.
-                    log.debug(e)
+                    log.info('This error was handled gracefully and logged '
+                             'for informational purposes only:\n' + str(e))
                     lhs_id = None
             else:
                 lhs_id = None
@@ -327,6 +331,8 @@ class SVNImplementation(M.RepositoryImplementation):
             last_commit = M.repo.Commit.query.get(_id=last_commit_id)
             M.repo_refresh.set_last_commit(
                 self._repo._id,
+                re.sub(r'/?$', '/', tree_path),  # force it to end with /
+                path,
                 self._tree_oid(commit._id, path),
                 M.repo_refresh.get_commit_info(last_commit))
             if info.kind == pysvn.node_kind.dir:
@@ -340,6 +346,13 @@ class SVNImplementation(M.RepositoryImplementation):
             else:
                 assert False
         session(tree).flush(tree)
+        trees_doc = RM.TreesDoc.m.get(_id=commit._id)
+        if not trees_doc:
+            trees_doc = RM.TreesDoc(dict(
+                _id=commit._id,
+                tree_ids=[]))
+        trees_doc.tree_ids.append(tree_id)
+        trees_doc.m.save(safe=False)
         return tree_id
 
     def _tree_oid(self, commit_id, path):

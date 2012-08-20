@@ -6,7 +6,7 @@ from hashlib import sha1
 from itertools import izip, chain
 from datetime import datetime
 from collections import defaultdict
-from difflib import SequenceMatcher
+from difflib import SequenceMatcher, unified_diff
 
 from pylons import c
 import pymongo.errors
@@ -37,7 +37,11 @@ VIEWABLE_EXTENSIONS = ['.php','.py','.js','.java','.html','.htm','.yaml','.sh',
     '.rb','.phtml','.txt','.bat','.ps1','.xhtml','.css','.cfm','.jsp','.jspx',
     '.pl','.php4','.php3','.rhtml','.svg','.markdown','.json','.ini','.tcl','.vbs','.xsl']
 
+DIFF_SIMILARITY_THRESHOLD = .5  # used for determining file renames
+
 # Basic commit information
+# One of these for each commit in the physical repo on disk. The _id is the
+# hexsha of the commit (for Git and Hg).
 CommitDoc = collection(
     'repo_ci', main_doc_session,
     Field('_id', str),
@@ -49,7 +53,7 @@ CommitDoc = collection(
     Field('child_ids', [str], index=True),
     Field('repo_ids', [ S.ObjectId() ], index=True))
 
-# Basic tree information
+# Basic tree information (also see TreesDoc)
 TreeDoc = collection(
     'repo_tree', main_doc_session,
     Field('_id', str),
@@ -58,10 +62,12 @@ TreeDoc = collection(
     Field('other_ids', [dict(name=str, id=str, type=SObjType)]))
 
 # Information about the last commit to touch a tree/blob
+# LastCommitDoc.object_id = TreeDoc._id
 LastCommitDoc = collection(
     'repo_last_commit', project_doc_session,
     Field('_id', str),
     Field('object_id', str, index=True),
+    Field('name', str),
     Field('commit_info', dict(
         id=str,
         date=datetime,
@@ -72,12 +78,15 @@ LastCommitDoc = collection(
         summary=str)))
 
 # List of all trees contained within a commit
+# TreesDoc._id = CommitDoc._id
+# TreesDoc.tree_ids = [ TreeDoc._id, ... ]
 TreesDoc = collection(
     'repo_trees', main_doc_session,
     Field('_id', str),
     Field('tree_ids', [str]))
 
 # Information about which things were added/removed in  commit
+# DiffInfoDoc._id = CommitDoc._id
 DiffInfoDoc = collection(
     'repo_diffinfo', main_doc_session,
     Field('_id', str),
@@ -86,6 +95,7 @@ DiffInfoDoc = collection(
         [ dict(name=str, lhs_id=str, rhs_id=str)]))
 
 # List of commit runs (a run is a linear series of single-parent commits)
+# CommitRunDoc.commit_ids = [ CommitDoc._id, ... ]
 CommitRunDoc = collection(
     'repo_commitrun', main_doc_session,
     Field('_id', str),
@@ -218,7 +228,16 @@ class Commit(RepoObject):
         return list(self.log_iter(skip, count))
 
     def count_revisions(self):
+        from .repo_refresh import CommitRunBuilder
         result = 0
+        # If there's no CommitRunDoc for this commit, the call to
+        # commitlog() below will raise a KeyError. Repair the CommitRuns for
+        # this repo by rebuilding them entirely.
+        if self.repo and not CommitRunDoc.m.find(dict(commit_ids=self._id)).count():
+            log.info('CommitRun incomplete, rebuilding with all commits')
+            rb = CommitRunBuilder(list(self.repo.all_commit_ids()))
+            rb.run()
+            rb.cleanup()
         for oid in commitlog([self._id]): result += 1
         return result
 
@@ -226,8 +245,12 @@ class Commit(RepoObject):
         result = dict(prev=None, next=None)
         if self.parent_ids:
             result['prev'] = self.query.find(dict(_id={'$in': self.parent_ids })).all()
+            for ci in result['prev']:
+                ci.set_context(self.repo)
         if self.child_ids:
             result['next'] = self.query.find(dict(_id={'$in': self.child_ids })).all()
+            for ci in result['next']:
+                ci.set_context(self.repo)
         return result
 
     @LazyProperty
@@ -246,9 +269,71 @@ class Commit(RepoObject):
                 added.append(change.name)
             else:
                 changed.append(change.name)
+        copied = self._diffs_copied(added, removed)
         return Object(
             added=added, removed=removed,
             changed=changed, copied=copied)
+
+    def _diffs_copied(self, added, removed):
+        '''Return list with file renames diffs.
+
+        Will change `added` and `removed` lists also.
+        '''
+        def _blobs_similarity(removed_blob, added):
+            best = dict(ratio=0, name='', blob=None)
+            for added_name in added:
+                added_blob = self.tree.get_obj_by_path(added_name)
+                if not isinstance(added_blob, Blob):
+                    continue
+                diff = SequenceMatcher(None, removed_blob.text,
+                                       added_blob.text)
+                ratio = diff.ratio()
+                if ratio > best['ratio']:
+                    best['ratio'] = ratio
+                    best['name'] = added_name
+                    best['blob'] = added_blob
+
+                if ratio == 1:
+                    break  # we'll won't find better similarity than 100% :)
+
+            if best['ratio'] > DIFF_SIMILARITY_THRESHOLD:
+                diff = ''
+                if best['ratio'] < 1:
+                    added_blob = best['blob']
+                    rpath = ('a' + removed_blob.path()).encode('utf-8')
+                    apath = ('b' + added_blob.path()).encode('utf-8')
+                    diff = ''.join(unified_diff(list(removed_blob),
+                                                list(added_blob),
+                                                rpath, apath))
+                return dict(new=best['name'],
+                            ratio=best['ratio'], diff=diff)
+
+        def _trees_similarity(removed_tree, added):
+            for added_name in added:
+                added_tree = self.tree.get_obj_by_path(added_name)
+                if not isinstance(added_tree, Tree):
+                    continue
+                if removed_tree._id == added_tree._id:
+                    return dict(new=added_name,
+                                ratio=1, diff='')
+
+        if not removed:
+            return []
+        copied = []
+        prev_commit = self.log(1, 1)[0]
+        for removed_name in removed[:]:
+            removed_blob = prev_commit.tree.get_obj_by_path(removed_name)
+            rename_info = None
+            if isinstance(removed_blob, Blob):
+                rename_info = _blobs_similarity(removed_blob, added)
+            elif isinstance(removed_blob, Tree):
+                rename_info = _trees_similarity(removed_blob, added)
+            if rename_info is not None:
+                rename_info['old'] = removed_name
+                copied.append(rename_info)
+                removed.remove(rename_info['old'])
+                added.remove(rename_info['new'])
+        return copied
 
     def get_path(self, path):
         if path[0] == '/': path = path[1:]
@@ -290,6 +375,22 @@ class Tree(RepoObject):
         obj.set_context(self, name)
         return obj
 
+    def get_obj_by_path(self, path):
+        if hasattr(path, 'get'):
+            path = path['new']
+        path = path.split('/')
+        obj = self
+        for p in path:
+            try:
+                obj = obj[p]
+            except KeyError:
+                return None
+        return obj
+
+    def get_blob_by_path(self, path):
+        obj = self.get_obj_by_path(path)
+        return obj if isinstance(obj, Blob) else None
+
     def set_context(self, commit_or_tree, name=None):
         assert commit_or_tree is not self
         self.repo = commit_or_tree.repo
@@ -311,15 +412,22 @@ class Tree(RepoObject):
 
     def ls(self):
         # Load last commit info
-        oids = [ x.id for x in chain(self.tree_ids, self.blob_ids, self.other_ids) ]
+        id_re = re.compile("^{0}:{1}:".format(self.repo._id, h.really_unicode(self.path()).encode('utf-8')))
         lc_index = dict(
+            (lc.name, lc.commit_info)
+            for lc in LastCommitDoc.m.find(dict(_id=id_re)))
+
+        # FIXME: Temporarily fall back to old, semi-broken lookup behavior until refresh is done
+        oids = [ x.id for x in chain(self.tree_ids, self.blob_ids, self.other_ids) ]
+        id_re = re.compile("^{0}:".format(self.repo._id))
+        lc_index.update(dict(
             (lc.object_id, lc.commit_info)
-            for lc in LastCommitDoc.m.find(dict(
-                    # repo_id=self.repo._id,
-                    object_id={'$in': oids})))
+            for lc in LastCommitDoc.m.find(dict(_id=id_re, object_id={'$in': oids}))))
+        # /FIXME
+
         results = []
-        def _get_last_commit(oid):
-            lc = lc_index.get(oid)
+        def _get_last_commit(name, oid):
+            lc = lc_index.get(name, lc_index.get(oid, None))
             if lc is None:
                 lc = dict(
                     author=None,
@@ -338,19 +446,19 @@ class Tree(RepoObject):
                     kind='DIR',
                     name=x.name,
                     href=x.name + '/',
-                    last_commit=_get_last_commit(x.id)))
+                    last_commit=_get_last_commit(x.name, x.id)))
         for x in sorted(self.blob_ids, key=lambda x:x.name):
             results.append(dict(
                     kind='FILE',
                     name=x.name,
                     href=x.name,
-                    last_commit=_get_last_commit(x.id)))
+                    last_commit=_get_last_commit(x.name, x.id)))
         for x in sorted(self.other_ids, key=lambda x:x.name):
             results.append(dict(
                     kind=x.type,
                     name=x.name,
                     href=None,
-                    last_commit=_get_last_commit(x.id)))
+                    last_commit=_get_last_commit(x.name, x.id)))
         return results
 
     def path(self):
@@ -486,7 +594,6 @@ mapper(Commit, CommitDoc, repository_orm_session)
 mapper(Tree, TreeDoc, repository_orm_session)
 
 def commitlog(commit_ids, skip=0, limit=sys.maxint):
-
     seen = set()
     def _visit(commit_id):
         if commit_id in seen: return

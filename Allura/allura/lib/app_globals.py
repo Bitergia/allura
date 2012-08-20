@@ -11,8 +11,8 @@ import datetime
 from urllib import urlencode
 from subprocess import Popen, PIPE
 
+import activitystream
 import pkg_resources
-
 import pysolr
 import markdown
 import pygments
@@ -122,6 +122,8 @@ class Globals(object):
             user=Icon('U', 'ico-user'),
             secure=Icon('(', 'ico-lock'),
             unsecure=Icon(')', 'ico-unlock'),
+            star=Icon('S', 'ico-star'),
+            watch=Icon('E', 'ico-watch'),
             # Permissions
             perm_read=Icon('E', 'ico-focus'),
             perm_update=Icon('0', 'ico-sync'),
@@ -146,6 +148,11 @@ class Globals(object):
 
         # Zarkov logger
         self._zarkov = None
+
+    @LazyProperty
+    def director(self):
+        """Return activitystream director"""
+        return activitystream.director()
 
     @LazyProperty
     def amq_conn(self):
@@ -280,7 +287,7 @@ class Globals(object):
     def forge_markdown(self, **kwargs):
         '''return a markdown.Markdown object on which you can call convert'''
         return ForgeMarkdown(
-                extensions=['codehilite', ForgeExtension(**kwargs), 'tables'],
+                extensions=['codehilite', ForgeExtension(**kwargs), 'tables', 'toc'],
                 output_format='html4')
 
     @property

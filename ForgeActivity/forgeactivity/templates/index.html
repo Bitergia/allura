@@ -3,10 +3,36 @@
 
 {% block title %}{{c.project.name}} Activity{% endblock %}
 
-{% block header %}{{c.project.name}} Activity{% endblock %}
+{% block header %}
+    Activity for
+    {% if c.project.is_user_project %}
+        {{c.project.user_project_of.display_name}}
+    {% else %}
+        {{c.project.name}}
+    {% endif %}
+{% endblock %}
+
+{% block actions %}
+    {% if c.user and c.user != c.user.anonymous() and followee != c.user %}
+        {{c.follow_toggle.display(following=following)}}
+    {% endif %}
+{% endblock %}
+
+{% macro activity_obj(o) %}
+  <a href="{{o['activity_url']}}">{{o['activity_name']}}</a>
+{% endmacro %}
 
 {% block content %}
-    <div class="grid-14">
-        Something happened.
-    </div>
+  <div class="grid-23">
+  {% if not timeline %}
+    No activity to display.
+  {% else %}
+    <ul>
+        {% for a in timeline %}
+        <li>{{activity_obj(a['actor'])}} {{a['verb']}} {{activity_obj(a['obj'])}} {% if a.get('target') %}on {{activity_obj(a['target'])}}{% endif %} {{h.ago(a['published'])}}</li>
+        <!-- Score: {{ a.get('score') }} -->
+        {% endfor %}
+    </ul>
+  {% endif %}
+  </div>
 {% endblock %}

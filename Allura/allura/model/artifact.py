@@ -20,6 +20,7 @@ from .session import project_doc_session, project_orm_session
 from .session import artifact_orm_session
 from .index import ArtifactReference
 from .types import ACL, ACE
+from .project import AppConfig
 
 from filesystem import File
 
@@ -120,7 +121,14 @@ class Artifact(MappedClass):
             if artifact is None: continue
             artifact = artifact.primary()
             # don't link to artifacts in deleted tools
-            if hasattr(artifact, 'app_config') and artifact.app_config is None: continue
+            if hasattr(artifact, 'app_config') and artifact.app_config is None:
+                continue
+            if artifact.type_s == 'Commit' and not artifact.repo:
+                ac = AppConfig.query.get(
+                        _id=ref.artifact_reference['app_config_id'])
+                app = ac.project.app_instance(ac) if ac else None
+                if app:
+                    artifact.set_context(app.repo)
             if artifact not in related_artifacts:
                 related_artifacts.append(artifact)
         return related_artifacts
@@ -660,3 +668,72 @@ class Feed(MappedClass):
                           author_name=r.author_name,
                           author_link=h.absurl(r.author_link))
         return feed
+
+
+class VotableArtifact(MappedClass):
+    """Voting support for the Artifact. Use as a mixin."""
+
+    class __mongometa__:
+        session = main_orm_session
+        name = 'vote'
+
+    votes = FieldProperty(int, if_missing=0)
+    votes_up = FieldProperty(int, if_missing=0)
+    votes_down = FieldProperty(int, if_missing=0)
+    votes_up_users = FieldProperty([str], if_missing=list())
+    votes_down_users = FieldProperty([str], if_missing=list())
+
+    def vote_up(self, user):
+        voted = self.user_voted(user)
+        if voted == 1:
+            # Already voted up - unvote
+            self.votes_up_users.remove(user.username)
+            self.votes_up -= 1
+        elif voted == -1:
+            # Change vote to negative
+            self.votes_down_users.remove(user.username)
+            self.votes_down -= 1
+            self.votes_up_users.append(user.username)
+            self.votes_up += 1
+        else:
+            self.votes_up_users.append(user.username)
+            self.votes_up += 1
+        self.votes = self.votes_up - self.votes_down
+
+    def vote_down(self, user):
+        voted = self.user_voted(user)
+        if voted == -1:
+            # Already voted down - unvote
+            self.votes_down_users.remove(user.username)
+            self.votes_down -= 1
+        elif voted == 1:
+            # Change vote to positive
+            self.votes_up_users.remove(user.username)
+            self.votes_up -= 1
+            self.votes_down_users.append(user.username)
+            self.votes_down += 1
+        else:
+            self.votes_down_users.append(user.username)
+            self.votes_down += 1
+        self.votes = self.votes_up - self.votes_down
+
+    def user_voted(self, user):
+        """Check that user voted for this artifact.
+
+        Return:
+        1 if user voted up
+        -1 if user voted down
+        0 if user doesn't vote
+        """
+        if user.username in self.votes_up_users:
+            return 1
+        if user.username in self.votes_down_users:
+            return -1
+        return 0
+
+    @property
+    def votes_up_percent(self):
+        votes_count = self.votes_up + self.votes_down
+        if votes_count == 0:
+            return 0
+        return int(float(self.votes_up) / votes_count * 100)

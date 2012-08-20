@@ -45,6 +45,7 @@ class ForgeSVNApp(RepositoryApp):
         self.root.feed = default_root.feed
         self.root.commit_browser = default_root.commit_browser
         self.root.commit_browser_data = default_root.commit_browser_data
+        self.root.status = default_root.status
         self.admin = SVNRepoAdminController(self)
 
     @LazyProperty
@@ -57,7 +58,7 @@ class ForgeSVNApp(RepositoryApp):
         SM.Repository(
             name=self.config.options.mount_point,
             tool='svn',
-            status='initing')
+            status='initializing')
         ThreadLocalORMSession.flush_all()
         init_from_url = self.config.options.get('init_from_url')
         if init_from_url:
@@ -124,5 +125,6 @@ class SVNImportController(BaseController):
                 cloned_from_url=checkout_url)
         M.Notification.post_user(
             c.user, self.app.repo, 'importing',
-            text='Repository import scheduled')
+            text='''Repository import scheduled,
+                   an email notification will be sent when complete.''')
         redirect(c.project.url() + 'admin/tools')

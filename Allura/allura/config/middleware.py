@@ -16,6 +16,7 @@ from beaker.middleware import SessionMiddleware
 from routes.middleware import RoutesMiddleware
 from pylons.middleware import StatusCodeRedirect
 
+import activitystream
 import ew
 import ming
 from ming.orm.middleware import MingMiddleware
@@ -70,6 +71,9 @@ def _make_core_app(root, global_conf, full_stack=True, **app_conf):
     patches.apply()
     # Configure MongoDB
     ming.configure(**app_conf)
+
+    # Configure ActivityStream
+    activitystream.configure(**app_conf)
 
     # Configure EW variable provider
     ew.render.TemplateEngine.register_variable_provider(get_tg_vars)

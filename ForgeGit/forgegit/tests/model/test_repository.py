@@ -3,10 +3,12 @@ import shutil
 import unittest
 import pkg_resources
 
+import mock
 import pylons
 pylons.c = pylons.tmpl_context
 pylons.g = pylons.app_globals
 from pylons import c, g
+from ming.base import Object
 from ming.orm import ThreadLocalORMSession
 from nose.tools import assert_equal
 
@@ -156,9 +158,16 @@ class TestGitRepo(unittest.TestCase):
         entry = self.repo.commit('HEAD')
         assert str(entry.authored.name) == 'Rick Copeland', entry.authored
         assert entry.message
+        # Test that sha1s for named refs are looked up in cache first, instead
+        # of from disk.
+        with mock.patch('forgegit.model.git_repo.M.repo.Commit.query') as q:
+            self.repo.heads.append(Object(name='HEAD', object_id='deadbeef'))
+            self.repo.commit('HEAD')
+            q.get.assert_called_with(_id='deadbeef')
 
     def test_commit_run(self):
-        commit_ids = self.repo.all_commit_ids()
+        M.repo.CommitRunDoc.m.remove()
+        commit_ids = list(self.repo.all_commit_ids())
         # simulate building up a commit run from multiple pushes
         for c_id in commit_ids:
             crb = M.repo_refresh.CommitRunBuilder([c_id])
@@ -167,6 +176,26 @@ class TestGitRepo(unittest.TestCase):
         runs = M.repo.CommitRunDoc.m.find().all()
         self.assertEqual(len(runs), 1)
         run = runs[0]
+        self.assertEqual(run.commit_ids, commit_ids)
+        self.assertEqual(len(run.commit_ids), len(run.commit_times))
+        self.assertEqual(run.parent_commit_ids, [])
+
+    def test_repair_commit_run(self):
+        commit_ids = list(self.repo.all_commit_ids())
+        # simulate building up a commit run from multiple pushes, but skip the
+        # last commit to simulate a broken commit run
+        for c_id in commit_ids[:-1]:
+            crb = M.repo_refresh.CommitRunBuilder([c_id])
+            crb.run()
+            crb.cleanup()
+        # now repair the commitrun by rebuilding with all commit ids
+        crb = M.repo_refresh.CommitRunBuilder(commit_ids)
+        crb.run()
+        crb.cleanup()
+        runs = M.repo.CommitRunDoc.m.find().all()
+        self.assertEqual(len(runs), 1)
+        run = runs[0]
+        self.assertEqual(run.commit_ids, commit_ids)
         self.assertEqual(len(run.commit_ids), len(run.commit_times))
         self.assertEqual(run.parent_commit_ids, [])
 

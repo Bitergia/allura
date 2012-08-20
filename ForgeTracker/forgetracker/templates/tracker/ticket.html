@@ -17,6 +17,8 @@
 <a href="{{ticket.url()}}feed.rss" title="Follow this Ticket"><b data-icon="{{g.icons['feed'].char}}" class="ico {{g.icons['feed'].css}}"></b></a>
 {% if c.user and c.user != c.user.anonymous() %}
   {{c.subscribe_form.display(value=subscribed, tool_subscribed=tool_subscribed, action='subscribe', style='icon')}}
+{% endif %}
+{% if h.has_access(ticket, 'update') %}
   <a href="#" title="Edit" class="edit_ticket"><b data-icon="{{g.icons['pencil'].char}}" class="ico {{g.icons['pencil'].css}}"></b> Edit</a>
 {% endif %}
 {% endblock %}
@@ -108,6 +110,9 @@
 {% endblock %}
 
 {% block content %}
+{% if voting_enabled %}
+  {{ c.vote_form.display(artifact=ticket) }}
+{% endif %}
 <div id="ticket_content">
   {{g.markdown.convert(ticket.description)|safe}}
   {% if ticket.attachments %}
@@ -143,7 +148,7 @@
 {% endblock %}
 
 {% block extra_js %}
-  {% if h.has_access(ticket, 'write')() %}
+  {% if h.has_access(ticket, 'update')() %}
     <script type="text/javascript">
         $(document).ready(function () {
           // show/hide form
@@ -154,6 +159,7 @@
           var title_holder = $('h2.dark');
           var original_title = title_holder.text();
           var title_actions = title_holder.find('small');
+          var vote = $('#vote')
           $('a.edit_ticket').click(function () {
             form_holder.show();
             view_holder.hide();
@@ -162,6 +168,7 @@
             title_actions.hide();
             title_actions.appendTo(document.body);
             title_holder.text('\u00A0');
+            vote.hide();
             $('a.edit_ticket').addClass('btn_activate');
             $('textarea[name="ticket_form.description"]').trigger('editticket.forgetracker').focus();
             $(this).trigger('editTicket');
@@ -175,6 +182,7 @@
             title_holder.text(original_title);
             title_actions.appendTo(title_holder);
             title_actions.show();
+            vote.show();
             $('a.edit_ticket').removeClass('btn_activate');
             return false;
           });

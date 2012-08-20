@@ -70,28 +70,38 @@ class HgImplementation(M.RepositoryImplementation):
 
     def clone_from(self, source_url):
         '''Initialize a repo as a clone of another'''
-        fullname = self._setup_paths(create_repo_dir=False)
-        if os.path.exists(fullname):
-            shutil.rmtree(fullname)
+        self._repo.status = 'cloning'
+        session(self._repo).flush(self._repo)
         log.info('Initialize %r as a clone of %s',
                  self._repo, source_url)
-        # !$ hg doesn't like unicode as urls
-        src, repo = hg.clone(
-            ui.ui(),
-            source_url.encode('utf-8'),
-            self._repo.full_fs_path.encode('utf-8'),
-            update=False)
-        self.__dict__['_hg'] = repo
-        self._setup_special_files()
-        self._repo.status = 'analyzing'
-        session(self._repo).flush()
-        log.info('... %r cloned, analyzing', self._repo)
+        try:
+            fullname = self._setup_paths(create_repo_dir=False)
+            if os.path.exists(fullname):
+                shutil.rmtree(fullname)
+            # !$ hg doesn't like unicode as urls
+            src, repo = hg.clone(
+                ui.ui(),
+                source_url.encode('utf-8'),
+                self._repo.full_fs_path.encode('utf-8'),
+                update=False)
+            self.__dict__['_hg'] = repo
+            self._setup_special_files()
+        except:
+            self._repo.status = 'raise'
+            session(self._repo).flush(self._repo)
+            raise
+        log.info('... %r cloned', self._repo)
         self._repo.refresh(notify=False)
-        self._repo.status = 'ready'
-        log.info('... %s ready', self._repo)
-        session(self._repo).flush()
 
     def commit(self, rev):
+        '''Return a Commit object.  rev can be _id or a branch/tag name'''
+        # See if the rev is a named ref that we have cached, and use the sha1
+        # from the cache. This ensures that we don't return a sha1 that we
+        # don't have indexed into mongo yet.
+        for ref in self._repo.heads + self._repo.branches + self._repo.repo_tags:
+            if ref.name == rev:
+                rev = ref.object_id
+                break
         result = M.repo.Commit.query.get(_id=rev)
         if result is None:
             try:
@@ -110,6 +120,11 @@ class HgImplementation(M.RepositoryImplementation):
         return [p for p in ci.parents() if p]
 
     def all_commit_ids(self):
+        """Return a list of commit ids, starting with the root (first commit)
+        of the tree and ending with the head(s).
+
+        NB: The ForgeGit implementation returns commits in the opposite order.
+        """
         graph = {}
         to_visit = [ self._hg[hd] for hd in self._hg.heads() ]
         while to_visit:
@@ -143,13 +158,17 @@ class HgImplementation(M.RepositoryImplementation):
     def refresh_heads(self):
         self._repo.heads = [
             Object(name=None, object_id=self._hg[head].hex())
-            for head in self._hg.heads() ]
-        self._repo.branches = [
-            Object(name=name, object_id=self._hg[tag].hex())
-            for name, tag in self._hg.branchtags().iteritems() ]
+            for head in self._hg.heads()]
+
+        self._repo.branches = []
+        for name, tag in self._hg.branchtags().iteritems():
+            if ("close" not in self._hg.changelog.read(tag)[5]):
+                self._repo.branches.append(
+                    Object(name=name, object_id=self._hg[tag].hex()))
+
         self._repo.repo_tags = [
             Object(name=name, object_id=self._hg[tag].hex())
-            for name, tag in self._hg.tags().iteritems() ]
+            for name, tag in self._hg.tags().iteritems()]
         session(self._repo).flush()
 
     def refresh_commit_info(self, oid, seen, lazy=True):
@@ -200,10 +219,10 @@ class HgImplementation(M.RepositoryImplementation):
         for name, t in tree.trees.iteritems():
             self.refresh_tree_info(t, seen, lazy)
             doc.tree_ids.append(
-                dict(name=name, id=t.hex()))
+                dict(name=h.really_unicode(name), id=t.hex()))
         for name, oid in tree.blobs.iteritems():
             doc.blob_ids.append(
-                dict(name=name, id=oid))
+                dict(name=h.really_unicode(name), id=oid))
         doc.m.save(safe=False)
         return doc
 

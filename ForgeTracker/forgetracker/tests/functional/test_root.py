@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import time
+import json
 import Image, StringIO
 import allura
 
@@ -13,6 +14,7 @@ from allura import model as M
 from forgewiki import model as wm
 from forgetracker import model as tm
 
+from allura.lib.security import has_access
 from allura.lib import helpers as h
 from allura.tests import decorators as td
 from ming.orm.ormsession import ThreadLocalORMSession
@@ -26,8 +28,10 @@ class TrackerTestController(TestController):
     def setup_with_tools(self):
         pass
 
-    def new_ticket(self, mount_point='/bugs/', **kw):
-        response = self.app.get(mount_point + 'new/')
+    def new_ticket(self, mount_point='/bugs/', extra_environ=None, **kw):
+        extra_environ = extra_environ or {}
+        response = self.app.get(mount_point + 'new/',
+                                extra_environ=extra_environ)
         form = response.forms[1]
         for k, v in kw.iteritems():
             form['ticket_form.%s' % k] = v
@@ -68,12 +72,45 @@ class TestMilestones(TrackerTestController):
         app = p.app_instance('bugs')
         assert len(app.globals.custom_fields) == 1, len(app.globals.custom_fields)
 
+def post_install_create_ticket_permission(app):
+    """Set to authenticated permission to create tickets but not update"""
+    role = M.ProjectRole.by_name('*authenticated')._id
+    create_permission = M.ACE.allow(role, 'create')
+    update_permission = M.ACE.allow(role, 'update')
+    acl = app.config.acl
+    acl.append(create_permission)
+    if update_permission in acl:
+        acl.remove(update_permission)
+
+def post_install_update_ticket_permission(app):
+    """Set to anonymous permission to create and update tickets"""
+    role = M.ProjectRole.by_name('*anonymous')._id
+    app.config.acl.append(M.ACE.allow(role, 'create'))
+    app.config.acl.append(M.ACE.allow(role, 'update'))
+
+
 class TestFunctionalController(TrackerTestController):
     def test_bad_ticket_number(self):
         self.app.get('/bugs/input.project_user_select', status=404)
 
     def test_invalid_ticket(self):
         self.app.get('/bugs/2/', status=404)
+
+    @patch('forgetracker.tracker_main.g.director.create_activity')
+    def test_activity(self, create_activity):
+        self.new_ticket(summary='my ticket', description='my description')
+        assert create_activity.call_count == 1
+        assert create_activity.call_args[0][1] == 'created'
+        create_activity.reset_mock()
+        self.app.post('/bugs/1/update_ticket',{
+            'summary':'my ticket',
+            'description':'new description',
+        })
+        # create_activity is called twice here:
+        #   - once for the ticket modification
+        #   - once for the auto-comment that's created for the ticket diff
+        assert create_activity.call_count == 2
+        assert create_activity.call_args[0][1] == 'modified'
 
     def test_new_ticket(self):
         summary = 'test new ticket'
@@ -143,11 +180,20 @@ class TestFunctionalController(TrackerTestController):
         r = self.app.get('/p/test/bugs/search/?q=ticket', extra_environ=env)
         assert '1 results' in r
         assert 'Private Ticket' not in r
+        # ... or in search feed...
+        r = self.app.get('/p/test/bugs/search_feed?q=ticket', extra_environ=env)
+        assert 'Private Ticket' not in r
         # ...and can't get to the private ticket directly.
         r = self.app.get(ticket_view.request.url, extra_environ=env)
         assert 'Private Ticket' not in r
         # ... and it doesn't appear in the feed
         r = self.app.get('/p/test/bugs/feed.atom')
+        assert 'Private Ticket' not in r
+        # ... or in the API ...
+        r = self.app.get('/rest/p/test/bugs/2/')
+        assert 'Private Ticket' not in r
+        assert '/auth/?return_to' in r.headers['Location']
+        r = self.app.get('/rest/p/test/bugs/')
         assert 'Private Ticket' not in r
 
     @td.with_tool('test', 'Tickets', 'doc-bugs')
@@ -171,10 +217,16 @@ class TestFunctionalController(TrackerTestController):
         ticket_view.mustcontain(summary, 'Discussion')
 
     def test_render_index(self):
+        admin = M.User.query.get(username='test-admin')
+        anon = M.User.query.get(username="*anonymous")
+        for app in M.AppConfig.query.find({'options.mount_point': 'bugs'}):
+            assert has_access(app, 'create', admin)
+            assert not has_access(app, 'create', anon)
+
         index_view = self.app.get('/bugs/')
         assert 'No open tickets found.' in index_view
         assert 'Create Ticket' in index_view
-        # No 'Create Ticket' button for user without 'write' perm
+        # No 'Create Ticket' button for user without 'create' perm
         r = self.app.get('/bugs/', extra_environ=dict(username='*anonymous'))
         assert 'Create Ticket' not in r
 
@@ -285,6 +337,10 @@ class TestFunctionalController(TrackerTestController):
         assert thumbnail.size == (100,100)
 
     def test_sidebar_static_page(self):
+        admin = M.User.query.get(username='test-admin')
+        for app in M.AppConfig.query.find({'options.mount_point': 'bugs'}):
+            assert has_access(app, 'create', admin)
+
         response = self.app.get('/bugs/search/')
         assert 'Create Ticket' in response
         assert 'Related Pages' not in response
@@ -494,69 +550,11 @@ class TestFunctionalController(TrackerTestController):
         r = self.app.get('/bugs/milestones')
         assert 'view closed' in r
 
-    def test_subtickets(self):
-        # create two tickets
-        self.new_ticket(summary='test superticket')
-        self.new_ticket(summary='test subticket')
-        h.set_context('test', 'bugs', neighborhood='Projects')
-        ThreadLocalORMSession.flush_all()
-        ThreadLocalORMSession.close_all()
-        super = tm.Ticket.query.get(ticket_num=1)
-        sub = tm.Ticket.query.get(ticket_num=2)
-
-        # make one ticket a subticket of the other
-        sub.set_as_subticket_of(super._id)
-        ThreadLocalORMSession.flush_all()
-
-        # get a view on the first ticket, check for other ticket listed in sidebar
-        ticket_view = self.app.get('/p/test/bugs/1/')
-        assert 'Supertask' not in ticket_view
-        assert '[#2]' in ticket_view
-
-        # get a view on the second ticket, check for other ticket listed in sidebar
-        ticket_view = self.app.get('/p/test/bugs/2/')
-        assert 'Supertask' in ticket_view
-        assert '[#1]' in ticket_view
-
-    def test_custom_sums(self):
-        # setup a custom sum field
-        r = self.app.post('/admin/bugs/set_custom_fields', {
-            'custom_fields-0.label': 'days',
-            'custom_fields-0.type': 'sum',
-            'custom_fields-0.sum': '',
-            'custom_fields-0.milestones': '',
-            'custom_fields-0.options': '',
-            'open_status_names': 'aa bb',
-            'closed_status_names': 'cc',
-            'milestone_names':'' })
-        # create three tickets
-        kw = {'custom_fields._days':'0'}
-        self.new_ticket(summary='test superticket', **kw)
-        self.new_ticket(summary='test subticket-1', **kw)
-        self.new_ticket(summary='test subticket-2', **kw)
-        ThreadLocalORMSession.flush_all()
-        ThreadLocalORMSession.close_all()
-        h.set_context('test', 'bugs', neighborhood='Projects')
-        super = tm.Ticket.query.get(ticket_num=1)
-        sub1 = tm.Ticket.query.get(ticket_num=2)
-        sub2 = tm.Ticket.query.get(ticket_num=3)
-
-        # set values for the custom sum
-        sub1.custom_fields['_days'] = '4.5'
-        sub2.custom_fields['_days'] = '2.0'
-
-        # make two tickets a subtickets of the other
-        sub1.set_as_subticket_of(super._id)
-        sub2.set_as_subticket_of(super._id)
-        ThreadLocalORMSession.flush_all()
-        ThreadLocalORMSession.close_all()
-
-        # get a view on the first ticket, check for other ticket listed in sidebar
-        ticket_view = self.app.get('/p/test/bugs/1/')
-        assert 'days' in ticket_view
-        assert '6.5' in ticket_view
-
     def test_edit_all_button(self):
+        admin = M.User.query.get(username='test-admin')
+        for app in M.AppConfig.query.find({'options.mount_point': 'bugs'}):
+            assert has_access(app, 'update', admin)
+
         response = self.app.get('/p/test/bugs/search/')
         assert 'Edit All' not in response
 
@@ -624,6 +622,16 @@ class TestFunctionalController(TrackerTestController):
         response = self.app.get('/p/test/bugs/search/?q=test')
         assert '3 results' in response, response.showbrowser()
         assert 'test third ticket' in response, response.showbrowser()
+
+    def test_search_feed(self):
+        self.new_ticket(summary='test first ticket')
+        ThreadLocalORMSession.flush_all()
+        M.MonQTask.run_ready()
+        ThreadLocalORMSession.flush_all()
+        response = self.app.get('/p/test/bugs/search_feed?q=test')
+        assert '<title>test first ticket</title>' in response
+        response = self.app.get('/p/test/bugs/search_feed.atom?q=test')
+        assert '<title>test first ticket</title>' in response
 
     def test_touch(self):
         self.new_ticket(summary='test touch')
@@ -777,6 +785,90 @@ class TestFunctionalController(TrackerTestController):
         assert_in('test second ticket', str(ticket_rows))
         assert_false('test third ticket' in str(ticket_rows))
 
+    def test_vote(self):
+        r = self.new_ticket(summary='test vote').follow()
+        assert_false(r.html.find('div', {'id': 'vote'}))
+
+        # enable voting
+        self.app.post('/admin/bugs/set_options',
+                      params={'EnableVoting': 'true'})
+
+        r = self.app.get('/bugs/1/')
+        votes_up = r.html.find('span', {'class': 'votes-up'})
+        votes_down = r.html.find('span', {'class': 'votes-down'})
+        assert_in('0', str(votes_up))
+        assert_in('0', str(votes_down))
+
+        # invalid vote
+        r = self.app.post('/bugs/1/vote', dict(vote='invalid'))
+        expected_resp = json.dumps(
+            dict(status='error', votes_up=0, votes_down=0, votes_percent=0))
+        assert r.response.content == expected_resp
+
+        # vote up
+        r = self.app.post('/bugs/1/vote', dict(vote='u'))
+        expected_resp = json.dumps(
+            dict(status='ok', votes_up=1, votes_down=0, votes_percent=100))
+        assert r.response.content == expected_resp
+
+        # vote down by another user
+        r = self.app.post('/bugs/1/vote', dict(vote='d'),
+                          extra_environ=dict(username='test-user-0'))
+
+        expected_resp = json.dumps(
+            dict(status='ok', votes_up=1, votes_down=1, votes_percent=50))
+        assert r.response.content == expected_resp
+
+        # make sure that on the page we see the same result
+        r = self.app.get('/bugs/1/')
+        votes_up = r.html.find('span', {'class': 'votes-up'})
+        votes_down = r.html.find('span', {'class': 'votes-down'})
+        assert_in('1', str(votes_up))
+        assert_in('1', str(votes_down))
+
+        r = self.app.get('/bugs/')
+        assert "Votes" in r
+        self.app.post(
+            '/admin/bugs/set_options',
+            params={'EnableVoting': 'false'})
+        r = self.app.get('/bugs/')
+        assert "Votes" not in r
+
+
+    @td.with_tool('test', 'Tickets', 'tracker',
+            post_install_hook=post_install_create_ticket_permission)
+    def test_create_permission(self):
+        """Test that user with `create` permission can create ticket,
+        but can't edit it without `update` permission.
+        """
+        response = self.app.get('/p/test/tracker/',
+                                extra_environ=dict(username='test-user-0'))
+        assert 'Create Ticket' in response
+
+        response = self.new_ticket(summary='test create, not update',
+                                   mount_point='/tracker/',
+                                   extra_environ=dict(username='test-user-0'))
+        ticket_url = response.headers['Location']
+        response = self.app.get(ticket_url,
+                                extra_environ=dict(username='test-user-0'))
+        assert not response.html.find('div',{'class': 'error'})
+        assert not response.html.find('a', {'class': 'edit_ticket'})
+
+    @td.with_tool('test', 'Tickets', 'tracker',
+            post_install_hook=post_install_update_ticket_permission)
+    def test_update_permission(self):
+        r = self.app.get('/p/test/tracker/',
+                         extra_environ=dict(username='*anonymous'))
+        assert 'Create Ticket' in r
+
+        r = self.new_ticket(summary='test', mount_point='/tracker/',
+                            extra_environ=dict(username='*anonymous'))
+        ticket_url = r.headers['Location']
+        r = self.app.get(ticket_url, extra_environ=dict(username='*anonymous'))
+        a = r.html.find('a', {'class': 'edit_ticket'})
+        assert a.text == 'Edit'
+
+
 class TestMilestoneAdmin(TrackerTestController):
     def _post(self, params, **kw):
         params['open_status_names'] = 'aa bb'
@@ -881,7 +973,8 @@ class TestMilestoneAdmin(TrackerTestController):
 def post_install_hook(app):
     role_anon = M.ProjectRole.by_name('*anonymous')._id
     app.config.acl.append(M.ACE.allow(role_anon, 'post'))
-    app.config.acl.append(M.ACE.allow(role_anon, 'write'))
+    app.config.acl.append(M.ACE.allow(role_anon, 'create'))
+    app.config.acl.append(M.ACE.allow(role_anon, 'update'))
 
 class TestEmailMonitoring(TrackerTestController):
     def __init__(self):
@@ -929,12 +1022,26 @@ class TestEmailMonitoring(TrackerTestController):
         self.new_ticket(summary='test')
         send_simple.assert_called_once_with(self.test_email)
         send_simple.reset_mock()
-        self.app.post('/bugs/1/update_ticket',{
-            'summary':'test',
-            'description':'update',
-        })
+        response = self.app.post(
+            '/bugs/1/update_ticket',
+            {'summary': 'test',
+            'description': 'update'})
         assert send_simple.call_count == 1, send_simple.call_count
         send_simple.assert_called_with(self.test_email)
+        send_simple.reset_mock()
+        response = response.follow()
+        for f in response.html.findAll('form'):
+            # Dirty way to find comment form
+            if (('thread' in f['action']) and ('post' in f['action'])):
+                params = {i['name']: i.get('value', '')
+                          for i in f.findAll('input')
+                          if i.has_key('name')}
+                params[f.find('textarea')['name']] = 'foobar'
+                self.app.post(str(f['action']), params)
+                break  # Do it only once if many forms met
+        assert send_simple.call_count == 1, send_simple.call_count
+        send_simple.assert_called_with(self.test_email)
+
 
     @patch('forgetracker.tracker_main.M.Notification.send_simple')
     def test_notifications_off(self, send_simple):

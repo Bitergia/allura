@@ -280,7 +280,9 @@ class ProjectController(object):
     @with_trailing_slash
     def index(self, **kw):
         mount = c.project.first_mount('read')
-        activity_enabled = asbool(config.get('activity_stream.enabled', False))
+        activity_enabled = config.get('activitystream.enabled', False)
+        activity_enabled = request.cookies.get('activitystream.enabled', activity_enabled)
+        activity_enabled = asbool(activity_enabled)
         if activity_enabled and c.project.app_instance('activity'):
             redirect('activity/')
         elif mount is not None:
@@ -477,22 +479,38 @@ class NeighborhoodAdminController(object):
     @require_post()
     @validate(W.neighborhood_overview_form, error_handler=overview)
     def update(self, name=None, css=None, homepage=None, project_template=None, icon=None, **kw):
-        self.neighborhood.name = name
-        self.neighborhood.redirect = kw.pop('redirect', '')
-        self.neighborhood.homepage = homepage
-        self.neighborhood.css = css
-        self.neighborhood.project_template = project_template
-        self.neighborhood.allow_browse = kw.get('allow_browse', False)
-        self.neighborhood.show_title = kw.get('show_title', False)
-        self.neighborhood.project_list_url = kw.get('project_list_url', '')
+        nbhd = self.neighborhood
+        c.project = nbhd.neighborhood_project
+        h.log_if_changed(nbhd, 'name', name, 
+                        'change neighborhood name to %s' % name)
+        nbhd_redirect = kw.pop('redirect', '')
+        h.log_if_changed(nbhd, 'redirect', nbhd_redirect,
+                        'change neighborhood redirect to %s' % nbhd_redirect)
+        h.log_if_changed(nbhd, 'homepage', homepage,
+                        'change neighborhood homepage to %s' % homepage)
+        h.log_if_changed(nbhd, 'css', css,
+                        'change neighborhood css to %s' % css)
+        h.log_if_changed(nbhd, 'project_template', project_template,
+                        'change neighborhood project template to %s'
+                        % project_template)
+        allow_browse = kw.get('allow_browse', False)
+        h.log_if_changed(nbhd, 'allow_browse', allow_browse,
+                        'change neighborhood allow browse to %s'
+                        % allow_browse)
+        show_title = kw.get('show_title', False)
+        h.log_if_changed(nbhd, 'show_title', show_title,
+                        'change neighborhood show title to %s' % show_title)
+        project_list_url = kw.get('project_list_url', '')
+        h.log_if_changed(nbhd, 'project_list_url', project_list_url,
+                        'change neighborhood project list url to %s'
+                        % project_list_url)
         tracking_id = kw.get('tracking_id', '')
-        if tracking_id != self.neighborhood.tracking_id:
-            c.project = self.neighborhood.neighborhood_project
-            M.AuditLog.log('update neighborhood tracking_id')
-            self.neighborhood.tracking_id = tracking_id
+        h.log_if_changed(nbhd, 'tracking_id', tracking_id,
+                        'update neighborhood tracking_id')
         if icon is not None and icon != '':
             if self.neighborhood.icon:
                 self.neighborhood.icon.delete()
+            M.AuditLog.log('update neighborhood icon')
             M.NeighborhoodFile.save_image(
                 icon.filename, icon.file, content_type=icon.type,
                 square=True, thumbnail_size=(48, 48),

@@ -12,8 +12,7 @@ from allura.tests import decorators as td
 from alluratest.controller import TestController
 
 
-class TestRootController(TestController):
-
+class SVNTestController(TestController):
     def setUp(self):
         TestController.setUp(self)
         self.setup_with_tools()
@@ -33,6 +32,26 @@ class TestRootController(TestController):
         ThreadLocalORMSession.flush_all()
         ThreadLocalORMSession.close_all()
         h.set_context('test', 'src', neighborhood='Projects')
+
+
+class TestRootController(SVNTestController):
+    def test_status(self):
+        resp = self.app.get('/src/status')
+        d = json.loads(resp.body)
+        assert d == dict(status='ready')
+
+    def test_status_html(self):
+        resp = self.app.get('/src/').follow()
+        # repo status not displayed if 'ready'
+        assert None == resp.html.find('div', dict(id='repo_status'))
+        h.set_context('test', 'src', neighborhood='Projects')
+        c.app.repo.status = 'analyzing'
+        ThreadLocalORMSession.flush_all()
+        ThreadLocalORMSession.close_all()
+        # repo status displayed if not 'ready'
+        resp = self.app.get('/src/').follow()
+        div = resp.html.find('div', dict(id='repo_status'))
+        assert div.span.text == 'analyzing'
 
     def test_index(self):
         resp = self.app.get('/src/').follow()
@@ -55,7 +74,6 @@ class TestRootController(TestController):
                 assert val['column'] == 0
                 assert val['row'] == 4
                 assert val['message'] == 'Create readme'
-
 
     def test_feed(self):
         r = self.app.get('/src/feed.rss')
@@ -86,3 +104,8 @@ class TestRootController(TestController):
         resp = self.app.get('/src/3/tree/README?diff=2')
         assert 'This is readme' in resp, resp.showbrowser()
         assert '+++' in resp, resp.showbrowser()
+
+
+class TestImportController(SVNTestController):
+    def test_index(self):
+        self.app.get('/p/test/admin/src/importer').follow(status=200)

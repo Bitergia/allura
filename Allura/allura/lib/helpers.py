@@ -76,27 +76,28 @@ def urlquoteplus(url, safe=""):
     except UnicodeEncodeError:
         return urllib.quote_plus(url.encode('utf-8'), safe=safe)
 
-def really_unicode(s):
+def _attempt_encodings(s, encodings):
     if s is None: return u''
-    # try naive conversion to unicode
-    try:
-        return unicode(s)
-    except UnicodeDecodeError:
-        pass
-    # Try to guess the encoding
-    encodings = [
-        lambda:'utf-8',
-        lambda:chardet.detect(s[:1024])['encoding'],
-        lambda:chardet.detect(s)['encoding'],
-        lambda:'latin-1',
-        ]
     for enc in encodings:
         try:
-            return unicode(s, enc())
-        except UnicodeDecodeError:
+            if enc is None:
+                return unicode(s)  # try default encoding
+            else:
+                return unicode(s, enc)
+        except (UnicodeDecodeError, LookupError):
             pass
     # Return the repr of the str -- should always be safe
     return unicode(repr(str(s)))[1:-1]
+
+def really_unicode(s):
+    # Try to guess the encoding
+    def encodings():
+        yield None
+        yield 'utf-8'
+        yield chardet.detect(s[:1024])['encoding']
+        yield chardet.detect(s)['encoding']
+        yield 'latin-1'
+    return _attempt_encodings(s, encodings())
 
 def find_project(url_path):
     from allura import model as M
@@ -574,14 +575,19 @@ INLINE = 'inline'
 TABLE = 'table'
 def render_any_markup(name, text, code_mode=False, linenumbers_style=TABLE):
     """
-    renders any markup format using the pypeline
+    renders markdown using allura enhacements if file is in markdown format
+    renders any other markup format using the pypeline
     Returns jinja-safe text
     """
     if text == '':
         text = '<p><em>Empty File</em></p>'
     else:
-        text = pylons.g.pypeline_markup.render(name, text)
-        if not pylons.g.pypeline_markup.can_render(name):
+        fmt = pylons.g.pypeline_markup.can_render(name)
+        if fmt == 'markdown':
+            text = pylons.g.markdown.convert(text)
+        else:
+            text = pylons.g.pypeline_markup.render(name, text)
+        if not fmt:
             if code_mode and linenumbers_style == INLINE:
                 text = _add_inline_line_numbers_to_text(text)
             elif code_mode and linenumbers_style == TABLE:
@@ -621,3 +627,19 @@ prefixes are used (Mebi, Gibi).
             if bytes < unit:
                 return '%.1f %s' % ((base * bytes / unit), prefix)
         return '%.1f %s' % ((base * bytes / unit), prefix)
+
+
+def log_if_changed(artifact, attr, new_val, message):
+    """Set `artifact.attr` to `new_val` if changed. Add AuditLog record."""
+    from allura import model as M
+    if not hasattr(artifact, attr):
+        return
+    if getattr(artifact, attr) != new_val:
+        M.AuditLog.log(message)
+        setattr(artifact, attr, new_val)
+
+
+def get_tool_package(tool_name):
+    "Return package for given tool (e.g. 'forgetracker' for 'tickets')"
+    app = pylons.g.entry_points['tool'].get(tool_name.lower())
+    return app.__module__.split('.')[0] if app else ''

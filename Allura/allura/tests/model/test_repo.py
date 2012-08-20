@@ -4,7 +4,7 @@ from itertools import count
 from datetime import datetime
 
 import mock
-from nose.tools import assert_equal, nottest
+from nose.tools import assert_equal
 from pylons import c
 import tg
 import ming
@@ -15,11 +15,14 @@ from alluratest.controller import setup_basic_test, setup_global_objects
 from allura import model as M
 from allura.lib import helpers as h
 
+
 class _Test(unittest.TestCase):
     idgen = ( 'obj_%d' % i for i in count())
 
     def _make_tree(self, object_id, **kwargs):
         t, isnew = M.repo.Tree.upsert(object_id)
+        repo = getattr(self, 'repo', None)
+        t.repo = repo
         for k,v in kwargs.iteritems():
             if isinstance(v, basestring):
                 obj = M.repo.Blob(
@@ -49,6 +52,12 @@ class _Test(unittest.TestCase):
             ci.tree = self._make_tree(ci.tree_id, **tree_parts)
         return ci, isnew
 
+    def _make_log(self, ci):
+        session(ci).flush(ci)
+        rb = M.repo_refresh.CommitRunBuilder([ci._id])
+        rb.run()
+        rb.cleanup()
+
     def setUp(self):
         setup_basic_test()
         setup_global_objects()
@@ -72,14 +81,14 @@ class _TestWithRepo(_Test):
         self.repo._impl._repo = self.repo
         self.repo._impl.all_commit_ids = lambda *a,**kw: []
         ThreadLocalORMSession.flush_all()
-        ThreadLocalORMSession.close_all()
+        # ThreadLocalORMSession.close_all()
 
 class _TestWithRepoAndCommit(_TestWithRepo):
     def setUp(self):
         super(_TestWithRepoAndCommit, self).setUp()
         self.ci, isnew = self._make_commit('foo')
         ThreadLocalORMSession.flush_all()
-        ThreadLocalORMSession.close_all()
+        # ThreadLocalORMSession.close_all()
 
 class TestRepo(_TestWithRepo):
 
@@ -274,13 +283,13 @@ class TestRepoObject(_TestWithRepoAndCommit):
     def test_set_last_commit(self):
         obj, isnew = M.repo.Tree.upsert('foo1')
         M.repo_refresh.set_last_commit(
-            self.repo._id, obj._id,
+            self.repo._id, '/', 'fakefile', obj._id,
             M.repo_refresh.get_commit_info(self.ci))
 
     def test_get_last_commit(self):
         obj, isnew = M.repo.Tree.upsert('foo1')
         lc0 = M.repo_refresh.set_last_commit(
-            self.repo._id, obj._id,
+            self.repo._id, '/', 'fakefile', obj._id,
             M.repo_refresh.get_commit_info(self.ci))
 
         lc1 = M.repo.LastCommitDoc.m.get(object_id=obj._id)
@@ -294,6 +303,7 @@ class TestRepoObject(_TestWithRepoAndCommit):
     def test_artifact_methods(self):
         assert self.ci.index_id() == 'allura/model/repo/Commit#foo', self.ci.index_id()
         assert self.ci.primary() is self.ci, self.ci.primary()
+
 
 class TestCommit(_TestWithRepo):
 
@@ -356,6 +366,7 @@ class TestCommit(_TestWithRepo):
                 == [])
         ci, isnew = self._make_commit('bar')
         ci.parent_ids = [ 'foo' ]
+        self._make_log(ci)
         M.repo_refresh.refresh_commit_trees(ci, {})
         M.repo_refresh.compute_diffs(self.repo._id, {}, ci)
         assert ci.diffs.removed == [ 'a' ]
@@ -371,6 +382,7 @@ class TestCommit(_TestWithRepo):
                     b='',),
                 b=''))
         ci.parent_ids = [ 'foo' ]
+        self._make_log(ci)
         M.repo_refresh.refresh_commit_trees(ci, {})
         M.repo_refresh.compute_diffs(self.repo._id, {}, ci)
         assert ci.diffs.added == [ 'b' ]
@@ -378,6 +390,69 @@ class TestCommit(_TestWithRepo):
         assert (ci.diffs.copied
                 == ci.diffs.changed
                 == [])
+
+    def test_diffs_file_renames(self):
+        def open_blob(blob):
+            blobs = {
+                u'a': u'Leia',
+                u'/b/a/a': u'Darth Vader',
+                u'/b/a/b': u'Luke Skywalker',
+                u'/b/b': u'Death Star will destroy you',
+                u'/b/c': u'Luke Skywalker',  # moved from /b/a/b
+                u'/b/a/z': u'Death Star will destroy you\nALL',  # moved from /b/b and modified
+            }
+            from cStringIO import StringIO
+            return StringIO(blobs[blob.path()])
+        self.repo._impl.open_blob = open_blob
+
+        self.repo._impl.commit = mock.Mock(return_value=self.ci)
+        M.repo_refresh.refresh_commit_trees(self.ci, {})
+        M.repo_refresh.compute_diffs(self.repo._id, {}, self.ci)
+        assert self.ci.diffs.added == ['a']
+        assert (self.ci.diffs.copied
+                == self.ci.diffs.changed
+                == self.ci.diffs.removed
+                == [])
+
+        ci, isnew = self._make_commit(
+            'bar',
+            b=dict(
+                a=dict(
+                    a='',
+                    b='',),
+                b=''))
+        ci.parent_ids = ['foo']
+        self._make_log(ci)
+        M.repo_refresh.refresh_commit_trees(ci, {})
+        M.repo_refresh.compute_diffs(self.repo._id, {}, ci)
+        assert ci.diffs.added == ['b']
+        assert ci.diffs.removed == ['a']
+        assert (ci.diffs.copied
+                == ci.diffs.changed
+                == [])
+
+        ci, isnew = self._make_commit(
+            'baz',
+            b=dict(
+                a=dict(
+                    z=''),
+                c=''))
+        ci.parent_ids = ['bar']
+        self._make_log(ci)
+        M.repo_refresh.refresh_commit_trees(ci, {})
+        M.repo_refresh.compute_diffs(self.repo._id, {}, ci)
+        assert ci.diffs.added == ci.diffs.changed == []
+        assert ci.diffs.removed == ['b/a/a']
+        # see mock for open_blob
+        assert len(ci.diffs.copied) == 2
+        assert ci.diffs.copied[0]['old'] == 'b/a/b'
+        assert ci.diffs.copied[0]['new'] == 'b/c'
+        assert ci.diffs.copied[0]['ratio'] == 1
+        assert ci.diffs.copied[0]['diff'] == ''
+        assert ci.diffs.copied[1]['old'] == 'b/b'
+        assert ci.diffs.copied[1]['new'] == 'b/a/z'
+        assert ci.diffs.copied[1]['ratio'] < 1
+        assert '+++' in ci.diffs.copied[1]['diff']
 
     def test_context(self):
         self.ci.context()

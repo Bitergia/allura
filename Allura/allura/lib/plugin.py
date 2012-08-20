@@ -139,6 +139,23 @@ class AuthenticationProvider(object):
             },
         ]
 
+    def project_url(self, user):
+        '''
+        :param user: a :class:`User <allura.model.auth.User>`
+        :rtype: str
+        '''
+        raise NotImplementedError, 'project_url'
+
+    def user_by_project_url(self, shortname):
+        '''
+        :param str: shortname
+        :rtype: user: a :class:`User <allura.model.auth.User>`
+        '''
+        raise NotImplementedError, 'user_by_project_url'
+
+    def update_notifications(self, user):
+        raise NotImplemented, 'update_notifications'
+
 class LocalAuthenticationProvider(AuthenticationProvider):
     '''
     Stores user passwords on the User model, in mongo.  Uses per-user salt and
@@ -185,8 +202,17 @@ class LocalAuthenticationProvider(AuthenticationProvider):
         hashpass = sha256(salt + password.encode('utf-8')).digest()
         return 'sha256' + salt + b64encode(hashpass)
 
-class LdapAuthenticationProvider(AuthenticationProvider):
+    def project_url(self, user):
+        return '/u/' + user.username.replace('_', '-') + '/'
 
+    def user_by_project_url(self, shortname):
+        from allura import model as M
+        return M.User.query.get(username=shortname)
+
+    def update_notifications(self, user):
+        return ''
+
+class LdapAuthenticationProvider(AuthenticationProvider):
     def register_user(self, user_doc):
         from allura import model as M
         password = user_doc['password'].encode('utf-8')

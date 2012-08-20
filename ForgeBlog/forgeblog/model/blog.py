@@ -1,5 +1,5 @@
 import difflib
-import hashlib
+import functools
 from datetime import datetime
 from random import randint
 
@@ -14,6 +14,7 @@ from ming.orm import FieldProperty, ForeignIdProperty, Mapper, session, state
 from ming.orm.declarative import MappedClass
 
 from allura import model as M
+from allura.model.timeline import ActivityObject
 from allura.lib import helpers as h
 from allura.lib import utils
 
@@ -69,7 +70,7 @@ class BlogPostSnapshot(M.Snapshot):
     def email_address(self):
         return self.original().email_address
 
-class BlogPost(M.VersionedArtifact):
+class BlogPost(M.VersionedArtifact, ActivityObject):
     class __mongometa__:
         name='blog_post'
         history_class = BlogPostSnapshot
@@ -82,6 +83,10 @@ class BlogPost(M.VersionedArtifact):
     slug = FieldProperty(str)
     state = FieldProperty(schema.OneOf('draft', 'published'), if_missing='draft')
     neighborhood_id = ForeignIdProperty('Neighborhood', if_missing=None)
+
+    @property
+    def activity_name(self):
+        return 'blog post %s' % self.title
 
     def author(self):
         '''The author of the first snapshot of this BlogPost'''
@@ -179,6 +184,8 @@ class BlogPost(M.VersionedArtifact):
         return HC.query.find({'artifact_id':self._id, 'version':int(version)}).one()
 
     def commit(self):
+        activity = functools.partial(g.director.create_activity, c.user,
+                target=c.project)
         self.subscribe()
         super(BlogPost, self).commit()
         if self.version > 1:
@@ -192,14 +199,17 @@ class BlogPost(M.VersionedArtifact):
                     'v%d' % v2.version))
             description = diff
             if v1.state != 'published' and v2.state == 'published':
+                activity('created', self)
                 M.Feed.post(self, self.title, self.text, author=self.author())
                 description = self.text
                 subject = '%s created post %s' % (
                     c.user.username, self.title)
             elif v1.title != v2.title:
+                activity('renamed', self)
                 subject = '%s renamed post %s to %s' % (
                     c.user.username, v2.title, v1.title)
             else:
+                activity('modified', self)
                 subject = '%s modified post %s' % (
                     c.user.username, self.title)
         else:
@@ -207,6 +217,7 @@ class BlogPost(M.VersionedArtifact):
             subject = '%s created post %s' % (
                 c.user.username, self.title)
             if self.state == 'published':
+                activity('created', self)
                 M.Feed.post(self, self.title, self.text, author=self.author())
         if self.state == 'published':
             M.Notification.post(

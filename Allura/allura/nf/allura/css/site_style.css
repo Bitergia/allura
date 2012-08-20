@@ -2704,6 +2704,11 @@ h1.title .viewer:hover {
   width: 32em;
 }
 
+/* Repo status indicator, displayed on repo pages if status != 'ready' */
+#repo_status h2 {
+  padding-left: 33px;
+}
+
 .neighborhood_feed_entry h3 {
   font-size: 1.1em;
 }
@@ -2746,4 +2751,13 @@ div.codehilite pre div.code_block {
     padding-left:10px;
     width: 97%;
 }
-
+input.nofloat {
+    float: none;
+}
+table thead tr th.narrow, table tr td.narrow {
+  padding-left: 2px;
+  padding-right: 2px;
+}
+#selected-projects {
+  padding: 10px 10px;
+}

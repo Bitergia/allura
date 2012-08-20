@@ -15,7 +15,7 @@ import pymongo
 from pylons import c, g, request
 
 from ming import schema as S
-from ming import Field, Index, collection
+from ming import Field, collection
 from ming.orm import session, state
 from ming.orm import FieldProperty, RelationProperty, ForeignIdProperty
 from ming.orm.declarative import MappedClass
@@ -26,6 +26,7 @@ from allura.lib import plugin
 
 from .session import main_orm_session, main_doc_session
 from .session import project_orm_session
+from .timeline import ActivityNode, ActivityObject
 
 log = logging.getLogger(__name__)
 
@@ -270,7 +271,7 @@ class AuthGlobals(MappedClass):
             new=True)
         return g.next_uid
 
-class User(MappedClass):
+class User(MappedClass, ActivityNode, ActivityObject):
     SALT_LEN=8
     class __mongometa__:
         name='user'
@@ -294,6 +295,10 @@ class User(MappedClass):
             email_address=str,
             email_format=str))
 
+    @property
+    def activity_name(self):
+        return self.display_name or self.username
+
     def get_pref(self, pref_name):
         return plugin.UserPreferencesProvider.get().get_pref(self, pref_name)
 
@@ -301,12 +306,12 @@ class User(MappedClass):
         return plugin.UserPreferencesProvider.get().set_pref(self, pref_name, pref_value)
 
     def url(self):
-        return '/u/' + self.username.replace('_', '-') + '/'
+        return plugin.AuthenticationProvider.get(request).project_url(self)
 
     def icon_url(self):
         icon_url = None
         if self.private_project() and self.private_project().icon:
-            icon_url = '/u/'+self.username.replace('_', '-')+'/user_icon'
+            icon_url = self.url()+'user_icon'
         elif self.preferences.email_address:
             icon_url = g.gravatar(self.preferences.email_address, default=None)
         return icon_url
@@ -428,7 +433,8 @@ class User(MappedClass):
         '''Find the projects for which this user has a named role.'''
         reaching_role_ids = g.credentials.user_roles(user_id=self._id).reaching_ids_set
         reaching_roles = [ ProjectRole.query.get(_id=i) for i in reaching_role_ids ]
-        named_roles = [ r for r in reaching_roles if r.name ]
+        named_roles = [ r for r in reaching_roles
+                                if r.name and r.project and not r.project.deleted ]
         seen_project_ids = set()
         for r in named_roles:
             if r.project_id in seen_project_ids: continue
@@ -455,6 +461,9 @@ class User(MappedClass):
         h.append(u'"%s" ' % self.get_pref('display_name'))
         h.append(u'<%s>' % self.get_pref('email_address'))
         return h
+
+    def update_notifications(self):
+        return plugin.AuthenticationProvider.get(request).update_notifications(self)
 
 class OldProjectRole(MappedClass):
     class __mongometa__:

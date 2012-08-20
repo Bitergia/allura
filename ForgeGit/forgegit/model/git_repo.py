@@ -84,27 +84,36 @@ class GitImplementation(M.RepositoryImplementation):
 
     def clone_from(self, source_url):
         '''Initialize a repo as a clone of another'''
-        fullname = self._setup_paths(create_repo_dir=False)
-        if os.path.exists(fullname):
-            shutil.rmtree(fullname)
+        self._repo.status = 'cloning'
+        session(self._repo).flush(self._repo)
         log.info('Initialize %r as a clone of %s',
                  self._repo, source_url)
-        repo = git.Repo.clone_from(
-            source_url,
-            to_path=fullname,
-            bare=True)
-        self.__dict__['_git'] = repo
-        self._setup_special_files()
-        self._repo.status = 'analyzing'
-        session(self._repo).flush()
-        log.info('... %r cloned, analyzing', self._repo)
+        try:
+            fullname = self._setup_paths(create_repo_dir=False)
+            if os.path.exists(fullname):
+                shutil.rmtree(fullname)
+            repo = git.Repo.clone_from(
+                source_url,
+                to_path=fullname,
+                bare=True)
+            self.__dict__['_git'] = repo
+            self._setup_special_files()
+        except:
+            self._repo.status = 'ready'
+            session(self._repo).flush(self._repo)
+            raise
+        log.info('... %r cloned', self._repo)
         self._repo.refresh(notify=False)
-        self._repo.status = 'ready'
-        log.info('... %s ready', self._repo)
-        session(self._repo).flush()
 
     def commit(self, rev):
         '''Return a Commit object.  rev can be _id or a branch/tag name'''
+        # See if the rev is a named ref that we have cached, and use the sha1
+        # from the cache. This ensures that we don't return a sha1 that we
+        # don't have indexed into mongo yet.
+        for ref in self._repo.heads + self._repo.branches + self._repo.repo_tags:
+            if ref.name == rev:
+                rev = ref.object_id
+                break
         result = M.repo.Commit.query.get(_id=rev)
         if result is None:
             # find the id by branch/tag name
@@ -124,6 +133,12 @@ class GitImplementation(M.RepositoryImplementation):
         return result
 
     def all_commit_ids(self):
+        """Yield commit ids, starting with the head(s) of the commit tree and
+        ending with the root (first commit).
+
+        NB: The ForgeHg and ForgeSVN implementations return commits in the
+        opposite order.
+        """
         seen = set()
         for head in self._git.heads:
             for ci in self._git.iter_commits(head, topo_order=True):

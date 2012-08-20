@@ -27,6 +27,7 @@ from allura.lib.widgets.repo import SCMLogWidget, SCMRevisionWidget, SCMTreeWidg
 from allura.lib.widgets.repo import SCMMergeRequestWidget, SCMMergeRequestFilterWidget
 from allura.lib.widgets.repo import SCMMergeRequestDisposeWidget, SCMCommitBrowserWidget
 from allura import model as M
+from allura.lib.widgets import form_fields as ffw
 
 from .base import BaseController
 
@@ -244,6 +245,10 @@ class RepoRootController(BaseController):
             next_column=len(columns),
             max_row=row)
 
+    @expose('json:')
+    def status(self, **kw):
+        return dict(status=c.app.repo.status)
+
 class RepoRestController(RepoRootController):
     @expose('json:')
     def index(self, **kw):
@@ -376,6 +381,8 @@ class CommitBrowser(BaseController):
     TreeBrowserClass=None
     revision_widget = SCMRevisionWidget()
     log_widget=SCMLogWidget()
+    page_list=ffw.PageList()
+    DEFAULT_PAGE_LIMIT = 25
 
     def __init__(self, revision):
         self._revision = revision
@@ -385,13 +392,24 @@ class CommitBrowser(BaseController):
         self.tree = self.TreeBrowserClass(self._commit, tree=self._commit.tree)
 
     @expose('jinja:allura:templates/repo/commit.html')
-    def index(self):
+    @validate(dict(page=validators.Int(if_empty=0),
+                   limit=validators.Int(if_empty=DEFAULT_PAGE_LIMIT)))
+    def index(self, page=0, limit=DEFAULT_PAGE_LIMIT):
         c.revision_widget = self.revision_widget
+        c.page_list = self.page_list
         result = dict(commit=self._commit)
         if self._commit:
             result.update(self._commit.context())
-        result['artifacts'] = [(t,f) for t in ('added', 'removed', 'changed', 'copied')
-                                     for f in self._commit.diffs[t]]
+        tree = self._commit.tree
+        limit, page, start = g.handle_paging(limit, page,
+                                             default=self.DEFAULT_PAGE_LIMIT)
+        result['artifacts'] = [
+                (t,f) for t in ('added', 'removed', 'changed', 'copied')
+                    for f in self._commit.diffs[t]
+                        if t == 'removed' or tree.get_blob_by_path(f)]
+        count = len(result['artifacts'])
+        result['artifacts'] = result['artifacts'][start:start+limit]
+        result.update(dict(page=page, limit=limit, count=count))
         return result
 
     @expose('jinja:allura:templates/repo/commit_basic.html')
@@ -444,7 +462,13 @@ class TreeBrowser(BaseController):
 
     @expose()
     def _lookup(self, next, *rest):
-        next=unquote(next)
+        if not rest and request.response_ext:
+            # Directory name may ends with file extension (e.g. `dir.rdf`)
+            # dispatching system will cut extension, so we need to restore it
+            next = "%s%s" % (next, request.response_ext)
+            request.response_ext = None
+            request.response_type = None
+        next = h.really_unicode(unquote(next))
         if not rest:
             # Might be a file rather than a dir
             filename = h.really_unicode(
@@ -527,10 +551,16 @@ class FileBrowser(BaseController):
         b = self._blob
         la = list(a)
         lb = list(b)
-        diff = ''.join(difflib.unified_diff(
-                la, lb,
-                ('a' + apath).encode('utf-8'),
-                ('b' + b.path()).encode('utf-8')))
+
+        diff = "Cannot display: file marked as a binary type."
+        not_binary_mime = ["text","octet-stream"]
+        for mime in not_binary_mime:
+            if mime in utils.guess_mime_type(filename):
+                diff = ''.join(difflib.unified_diff(
+                       la, lb,
+                       ('a' + apath).encode('utf-8'),
+                       ('b' + b.path()).encode('utf-8')))
+
         return dict(
             a=a, b=b,
             diff=diff)

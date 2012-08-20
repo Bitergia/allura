@@ -18,9 +18,12 @@ from ming.orm import Mapper, session
 from ming.orm import FieldProperty, ForeignIdProperty, RelationProperty
 from ming.orm.declarative import MappedClass
 
-from allura.model import Artifact, VersionedArtifact, Snapshot, project_orm_session, BaseAttachment
+from allura.model import (Artifact, VersionedArtifact, Snapshot,
+                          project_orm_session, BaseAttachment, VotableArtifact)
 from allura.model import User, Feed, Thread, Notification, ProjectRole
 from allura.model import ACE, ALL_PERMISSIONS, DENY_ALL
+from allura.model.timeline import ActivityObject
+
 from allura.lib import security
 from allura.lib.search import search_artifact
 from allura.lib import utils
@@ -175,7 +178,7 @@ class TicketHistory(Snapshot):
             text=self.data.summary)
         return result
 
-class Bin(Artifact):
+class Bin(Artifact, ActivityObject):
     class __mongometa__:
         name = 'bin'
 
@@ -184,6 +187,10 @@ class Bin(Artifact):
     summary = FieldProperty(str, required=True, allow_none=False)
     terms = FieldProperty(str, if_missing='')
     sort = FieldProperty(str, if_missing='')
+
+    @property
+    def activity_name(self):
+        return 'search bin %s' % self.summary
 
     def url(self):
         base = self.app_config.url() + 'search/?'
@@ -203,7 +210,7 @@ class Bin(Artifact):
             terms_s=self.terms)
         return result
 
-class Ticket(VersionedArtifact):
+class Ticket(VersionedArtifact, ActivityObject, VotableArtifact):
     class __mongometa__:
         name = 'ticket'
         history_class = TicketHistory
@@ -221,8 +228,6 @@ class Ticket(VersionedArtifact):
     _id = FieldProperty(schema.ObjectId)
     created_date = FieldProperty(datetime, if_missing=datetime.utcnow)
 
-    super_id = FieldProperty(schema.ObjectId, if_missing=None)
-    sub_ids = FieldProperty([schema.ObjectId])
     ticket_num = FieldProperty(int, required=True, allow_none=False)
     summary = FieldProperty(str)
     description = FieldProperty(str, if_missing='')
@@ -233,6 +238,10 @@ class Ticket(VersionedArtifact):
     custom_fields = FieldProperty({str:None})
 
     reported_by = RelationProperty(User, via='reported_by_id')
+
+    @property
+    def activity_name(self):
+        return 'ticket #%s' % self.ticket_num
 
     @classmethod
     def new(cls):
@@ -265,7 +274,11 @@ class Ticket(VersionedArtifact):
             milestone_s=self.milestone,
             status_s=self.status,
             text=self.description,
-            snippet_s=self.summary)
+            snippet_s=self.summary,
+            votes_up_i=self.votes_up,
+            votes_down_i=self.votes_down,
+            votes_total_i=(self.votes_up-self.votes_down)
+            )
         for k,v in self.custom_fields.iteritems():
             result[k + '_s'] = unicode(v)
         if self.reported_by:
@@ -329,6 +342,14 @@ class Ticket(VersionedArtifact):
     @property
     def open_or_closed(self):
         return 'closed' if self.status in c.app.globals.set_of_closed_status_names else 'open'
+
+    @property
+    def monitoring_email(self):
+        return c.app.config.options.get('TicketMonitoringEmail')
+
+    @property
+    def notify_post(self):
+        return c.app.config.options.get('TicketMonitoringType') == 'AllTicketChanges'
 
     def get_custom_user(self, custom_user_field_name):
         fld = None
@@ -428,82 +449,15 @@ class Ticket(VersionedArtifact):
         return TicketAttachment.query.find(dict(
             app_config_id=self.app_config_id, artifact_id=self._id, type='attachment'))
 
-    def set_as_subticket_of(self, new_super_id):
-        # For this to be generally useful we would have to check first that
-        # new_super_id is not a sub_id (recursively) of self
-
-        if self.super_id == new_super_id:
-            return
-
-        if self.super_id is not None:
-            old_super = Ticket.query.get(_id=self.super_id, app_config_id=c.app.config._id)
-            old_super.sub_ids = [id for id in old_super.sub_ids if id != self._id]
-            old_super.dirty_sums(dirty_self=True)
-
-        self.super_id = new_super_id
-
-        if new_super_id is not None:
-            new_super = Ticket.query.get(_id=new_super_id, app_config_id=c.app.config._id)
-            if new_super.sub_ids is None:
-                new_super.sub_ids = []
-            if self._id not in new_super.sub_ids:
-                new_super.sub_ids.append(self._id)
-            new_super.dirty_sums(dirty_self=True)
-
-    def recalculate_sums(self, super_sums=None):
-        """Calculate custom fields of type 'sum' (if any) by recursing into subtickets (if any)."""
-        if super_sums is None:
-            super_sums = {}
-            globals = Globals.query.get(app_config_id=c.app.config._id)
-            for k in [cf.name for cf in globals.custom_fields or [] if cf['type'] == 'sum']:
-                super_sums[k] = float(0)
-
-        # if there are no custom fields of type 'sum', we're done
-        if not super_sums:
-            return
-
-        # if this ticket has no subtickets, use its field values directly
-        if not self.sub_ids:
-            for k in super_sums:
-                try:
-                    v = float(self.custom_fields.get(k, 0))
-                except (TypeError, ValueError):
-                    v = 0
-                super_sums[k] += v
-
-        # else recurse into subtickets
-        else:
-            sub_sums = {}
-            for k in super_sums:
-                sub_sums[k] = float(0)
-            for id in self.sub_ids:
-                subticket = Ticket.query.get(_id=id, app_config_id=c.app.config._id)
-                subticket.recalculate_sums(sub_sums)
-            for k, v in sub_sums.iteritems():
-                self.custom_fields[k] = v
-                super_sums[k] += v
-
-    def dirty_sums(self, dirty_self=False):
-        """From a changed ticket, climb the superticket chain to call recalculate_sums at the root."""
-        root = self if dirty_self else None
-        next_id = self.super_id
-        while next_id is not None:
-            root = Ticket.query.get(_id=next_id, app_config_id=c.app.config._id)
-            next_id = root.super_id
-        if root is not None:
-            root.recalculate_sums()
-
     def update(self, ticket_form):
         self.globals.invalidate_bin_counts()
         # update is not allowed to change the ticket_num
         ticket_form.pop('ticket_num', None)
         self.labels = ticket_form.pop('labels', [])
-        custom_sums = set()
         custom_users = set()
         other_custom_fields = set()
         for cf in self.globals.custom_fields or []:
-            (custom_sums if cf['type'] == 'sum' else
-             custom_users if cf['type'] == 'user' else
+            (custom_users if cf['type'] == 'user' else
              other_custom_fields).add(cf['name'])
             if cf['type'] == 'boolean' and 'custom_fields.' + cf['name'] not in ticket_form:
                 self.custom_fields[cf['name']] = 'False'
@@ -523,17 +477,11 @@ class Ticket(VersionedArtifact):
                     user = c.project.user_in_project(v)
                     if user:
                         self.assigned_to_id = user._id
-            elif k != 'super_id':
+            else:
                 setattr(self, k, v)
         if 'custom_fields' in ticket_form:
             for k,v in ticket_form['custom_fields'].iteritems():
-                if k in custom_sums:
-                    # sums must be coerced to numeric type
-                    try:
-                        self.custom_fields[k] = float(v)
-                    except (TypeError, ValueError):
-                        self.custom_fields[k] = 0
-                elif k in custom_users:
+                if k in custom_users:
                     # restrict custom user field values to project members
                     user = self.app_config.project.user_in_project(v)
                     self.custom_fields[k] = user.username \
@@ -546,11 +494,6 @@ class Ticket(VersionedArtifact):
             self.attach(
                 attachment.filename, attachment.file,
                 content_type=attachment.type)
-        # flush so we can participate in a subticket search (if any)
-        session(self).flush()
-        super_id = ticket_form.get('super_id')
-        if super_id:
-            self.set_as_subticket_of(bson.ObjectId(super_id))
 
     def __json__(self):
         return dict(super(Ticket,self).__json__(),
@@ -567,10 +510,14 @@ class Ticket(VersionedArtifact):
             custom_fields=self.custom_fields)
 
     @classmethod
-    def paged_query(cls, query, limit=None, page=0, sort=None, columns=None, **kw):
-        """Query tickets, sorting and paginating the result."""
+    def paged_query(cls, app_config, user, query, limit=None, page=0, sort=None, **kw):
+        """
+        Query tickets, filtering for 'read' permission, sorting and paginating the result.
+
+        See also paged_search which does a solr search
+        """
         limit, page, start = g.handle_paging(limit, page, default=25)
-        q = cls.query.find(dict(query, app_config_id=c.app.config._id))
+        q = cls.query.find(dict(query, app_config_id=app_config._id))
         q = q.sort('ticket_num')
         if sort:
             field, direction = sort.split()
@@ -585,26 +532,76 @@ class Ticket(VersionedArtifact):
         tickets = []
         count = q.count()
         for t in q:
-            if security.has_access(t, 'read'):
+            if security.has_access(t, 'read', user, app_config.project):
                 tickets.append(t)
             else:
                 count = count -1
-        sortable_custom_fields=c.app.globals.sortable_custom_fields_shown_in_search()
-        if not columns:
-            columns = [dict(name='ticket_num', sort_name='ticket_num', label='Ticket Number', active=True),
-                       dict(name='summary', sort_name='summary', label='Summary', active=True),
-                       dict(name='_milestone', sort_name='custom_fields._milestone', label='Milestone', active=True),
-                       dict(name='status', sort_name='status', label='Status', active=True),
-                       dict(name='assigned_to', sort_name='assigned_to_username', label='Owner', active=True)]
-            for field in sortable_custom_fields:
-                columns.append(
-                    dict(name=field['name'], sort_name=field['name'], label=field['label'], active=True))
+
         return dict(
             tickets=tickets,
-            sortable_custom_fields=sortable_custom_fields,
-            columns=columns,
             count=count, q=json.dumps(query), limit=limit, page=page, sort=sort,
             **kw)
+
+    @classmethod
+    def paged_search(cls, app_config, user, q, limit=None, page=0, sort=None, **kw):
+        """Query tickets from Solr, filtering for 'read' permission, sorting and paginating the result.
+
+        See also paged_query which does a mongo search.
+
+        We do the sorting and skipping right in SOLR, before we ever ask
+        Mongo for the actual tickets.  Other keywords for
+        search_artifact (e.g., history) or for SOLR are accepted through
+        kw.  The output is intended to be used directly in templates,
+        e.g., exposed controller methods can just:
+
+            return paged_query(q, ...)
+
+        If you want all the results at once instead of paged you have
+        these options:
+          - don't call this routine, search directly in mongo
+          - call this routine with a very high limit and TEST that
+            count<=limit in the result
+        limit=-1 is NOT recognized as 'all'.  500 is a reasonable limit.
+        """
+
+        limit, page, start = g.handle_paging(limit, page, default=25)
+        count = 0
+        tickets = []
+        refined_sort = sort if sort else 'ticket_num_i asc'
+        if  'ticket_num_i' not in refined_sort:
+            refined_sort += ',ticket_num_i asc'
+        try:
+            if q:
+                matches = search_artifact(
+                    cls, q,
+                    rows=limit, sort=refined_sort, start=start, fl='ticket_num_i', **kw)
+            else:
+                matches = None
+            solr_error = None
+        except ValueError, e:
+            solr_error = e.args[0]
+            matches = []
+        if matches:
+            count = matches.hits
+            # ticket_numbers is in sorted order
+            ticket_numbers = [match['ticket_num_i'] for match in matches.docs]
+            # but query, unfortunately, returns results in arbitrary order
+            query = cls.query.find(dict(app_config_id=app_config._id, ticket_num={'$in':ticket_numbers}))
+            # so stick all the results in a dictionary...
+            ticket_for_num = {}
+            for t in query:
+                ticket_for_num[t.ticket_num] = t
+            # and pull them out in the order given by ticket_numbers
+            tickets = []
+            for tn in ticket_numbers:
+                if tn in ticket_for_num:
+                    if security.has_access(ticket_for_num[tn], 'read', user, app_config.project):
+                        tickets.append(ticket_for_num[tn])
+                    else:
+                        count = count -1
+        return dict(tickets=tickets,
+                    count=count, q=q, limit=limit, page=page, sort=sort,
+                    solr_error=solr_error, **kw)
 
 class TicketAttachment(BaseAttachment):
     thumbnail_size = (100, 100)

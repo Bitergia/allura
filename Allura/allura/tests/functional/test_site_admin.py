@@ -40,3 +40,23 @@ class TestSiteAdmin(TestController):
     def test_tickets_access(self):
         r = self.app.get('/nf/admin/api_tickets', extra_environ=dict(
                 username='test-user'), status=403)
+
+    def test_new_projects_access(self):
+        self.app.get('/nf/admin/new_projects', extra_environ=dict(
+            username='test_user'), status=403)
+        r = self.app.get('/nf/admin/new_projects', extra_environ=dict(
+            username='*anonymous'), status=302).follow()
+        assert 'Login' in r
+
+    def test_new_projects(self):
+        r = self.app.get('/nf/admin/new_projects', extra_environ=dict(
+                username='root'))
+        headers = r.html.find('table').findAll('th')
+        assert headers[1].contents[0] == 'Created'
+        assert headers[2].contents[0] == 'Shortname'
+        assert headers[3].contents[0] == 'Name'
+        assert headers[4].contents[0] == 'Short description'
+        assert headers[5].contents[0] == 'Summary'
+        assert headers[6].contents[0] == 'Deleted?'
+        assert headers[7].contents[0] == 'Homepage'
+        assert headers[8].contents[0] == 'Admins'

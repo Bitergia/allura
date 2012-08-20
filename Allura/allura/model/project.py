@@ -1,12 +1,8 @@
-
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from tg import config
 from pylons import c, g, request
-import pkg_resources
-from webob import exc
-from bson import ObjectId
 
 from ming import schema as S
 from ming.utils import LazyProperty
@@ -22,9 +18,10 @@ from allura.lib import security
 from allura.lib.security import has_access
 
 from .session import main_orm_session
-from .session import project_doc_session, project_orm_session
+from .session import project_orm_session, project_doc_session
 from .neighborhood import Neighborhood
 from .auth import ProjectRole
+from .timeline import ActivityNode, ActivityObject
 from .types import ACL, ACE
 
 from filesystem import File
@@ -102,7 +99,7 @@ class ProjectMapperExtension(MapperExtension):
     def after_insert(self, obj, st, sess):
         g.zarkov_event('project_create', project=obj)
 
-class Project(MappedClass):
+class Project(MappedClass, ActivityNode, ActivityObject):
     _perms_base = [ 'read', 'update', 'admin', 'create']
     _perms_init = _perms_base + [ 'register' ]
     class __mongometa__:
@@ -166,6 +163,10 @@ class Project(MappedClass):
     is_nbhd_project=FieldProperty(bool, if_missing=False)
 
     @property
+    def activity_name(self):
+        return self.shortname
+
+    @property
     def permissions(self):
         if self.shortname == '--init--':
             return self._perms_init
@@ -178,9 +179,7 @@ class Project(MappedClass):
 
     @classmethod
     def default_database_uri(cls, shortname):
-        base = config.get('ming.project.master')
-        db = config.get('ming.project.database')
-        return base + '/' + db
+        return config.get('ming.project.uri')
 
     @LazyProperty
     def allowed_tool_status(self):
@@ -289,8 +288,7 @@ class Project(MappedClass):
         '''
         user = None
         if self.is_user_project:
-            from .auth import User
-            user = User.query.get(username=self.shortname[2:])
+            user = plugin.AuthenticationProvider.get(request).user_by_project_url(self.shortname[2:])
         return user
 
     @LazyProperty
@@ -514,6 +512,11 @@ class Project(MappedClass):
                 'project_id':self._id,
                 'options.mount_point':mount_point}).first()
 
+    def app_config_by_tool_type(self, tool_type):
+        for ac in self.app_configs:
+            if ac.tool_name == tool_type:
+                return ac
+
     def new_subproject(self, name, install_apps=True, user=None):
         if not h.re_path_portion.match(name):
             raise exceptions.ToolError, 'Mount point "%s" is invalid' % name
@@ -590,6 +593,13 @@ class Project(MappedClass):
             g.credentials,
             g.credentials.project_roles(project_id=self.root_project._id).named)
         return [ r.user for r in named_roles.roles_that_reach if r.user_id is not None ]
+
+    def admins(self):
+        """Find all the users who have 'Admin' role for this project"""
+        admin_role = ProjectRole.query.get(name='Admin', project_id=self._id)
+        if not admin_role:
+            return []
+        return [r.user.username for r in admin_role.users_with_role(self)]
 
     def user_in_project(self, username):
         from .auth import User

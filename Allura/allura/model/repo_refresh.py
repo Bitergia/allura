@@ -1,6 +1,7 @@
 import logging
 from itertools import chain
 from cPickle import dumps
+import re
 
 import bson
 
@@ -22,6 +23,9 @@ QSIZE=100
 
 def refresh_repo(repo, all_commits=False, notify=True):
     all_commit_ids = commit_ids = list(repo.all_commit_ids())
+    if not commit_ids:
+        # the repo is empty, no need to continue
+        return
     new_commit_ids = unknown_commit_ids(commit_ids)
     stats_log = h.log_action(log, 'commit')
     for ci in new_commit_ids:
@@ -33,7 +37,7 @@ def refresh_repo(repo, all_commits=False, notify=True):
     if not all_commits:
         # Skip commits that are already in the DB
         commit_ids = new_commit_ids
-    log.info('Refreshing %d commits', len(commit_ids))
+    log.info('Refreshing %d commits on %s', len(commit_ids), repo.full_fs_path)
 
     # Refresh commits
     seen = set()
@@ -52,25 +56,47 @@ def refresh_repo(repo, all_commits=False, notify=True):
             log.info('Refresh child info %d for parents of %s', (i+1), ci._id)
 
     # Refresh commit runs
-    rb = CommitRunBuilder(commit_ids)
+    commit_run_ids = commit_ids
+    # Check if the CommitRuns for the repo are in a good state by checking for
+    # a CommitRunDoc that contains the last known commit. If there isn't one,
+    # the CommitRuns for this repo are in a bad state - rebuild them entirely.
+    if commit_run_ids != all_commit_ids:
+        last_commit = last_known_commit_id(all_commit_ids, new_commit_ids)
+        log.info('Last known commit id: %s', last_commit)
+        if not CommitRunDoc.m.find(dict(commit_ids=last_commit)).count():
+            log.info('CommitRun incomplete, rebuilding with all commits')
+            commit_run_ids = all_commit_ids
+    log.info('Starting CommitRunBuilder for %s', repo.full_fs_path)
+    rb = CommitRunBuilder(commit_run_ids)
     rb.run()
     rb.cleanup()
+    log.info('Finished CommitRunBuilder for %s', repo.full_fs_path)
 
     # Refresh trees
-    cache = {}
-    for i, oid in enumerate(commit_ids):
-        ci = CommitDoc.m.find(dict(_id=oid), validate=False).next()
-        cache = refresh_commit_trees(ci, cache)
-        if (i+1) % 100 == 0:
-            log.info('Refresh commit trees %d: %s', (i+1), ci._id)
+    # Like diffs below, pre-computing trees for SVN repos is too expensive,
+    # so we skip it here, then do it on-demand later.
+    if repo.tool.lower() != 'svn':
+        cache = {}
+        for i, oid in enumerate(commit_ids):
+            ci = CommitDoc.m.find(dict(_id=oid), validate=False).next()
+            cache = refresh_commit_trees(ci, cache)
+            if (i+1) % 100 == 0:
+                log.info('Refresh commit trees %d: %s', (i+1), ci._id)
 
     # Compute diffs
     cache = {}
-    for i, oid in enumerate(reversed(commit_ids)):
-        ci = CommitDoc.m.find(dict(_id=oid), validate=False).next()
-        compute_diffs(repo._id, cache, ci)
-        if (i+1) % 100 == 0:
-            log.info('Compute diffs %d: %s', (i+1), ci._id)
+    # Have to compute_diffs() for all commits to ensure that LastCommitDocs
+    # are set properly for forked repos. For SVN, compute_diffs() we don't
+    # want to pre-compute the diffs because that would be too expensive, so
+    # we skip them here and do them on-demand with caching.
+    if repo.tool.lower() != 'svn':
+        for i, oid in enumerate(reversed(all_commit_ids)):
+            ci = CommitDoc.m.find(dict(_id=oid), validate=False).next()
+            compute_diffs(repo._id, cache, ci)
+            if (i+1) % 100 == 0:
+                log.info('Compute diffs %d: %s', (i+1), ci._id)
+
+    log.info('Refresh complete for %s', repo.full_fs_path)
 
     # Send notifications
     if notify:
@@ -78,7 +104,7 @@ def refresh_repo(repo, all_commits=False, notify=True):
 
 def refresh_commit_trees(ci, cache):
     '''Refresh the list of trees included withn a commit'''
-    if ci.tree_id is None: return
+    if ci.tree_id is None: return cache
     trees_doc = TreesDoc(dict(
             _id=ci._id,
             tree_ids = list(trees(ci.tree_id, cache))))
@@ -198,6 +224,12 @@ class CommitRunBuilder(object):
             run.m.save()
             runs[p_cis[0]].m.delete()
         for run1 in self._all_runs():
+            # if run1 is a subset of another run, delete it
+            if CommitRunDoc.m.find(dict(commit_ids={'$all': run1.commit_ids},
+                    _id={'$ne': run1._id})).count():
+                log.info('... delete %r (subset of another run)', run1)
+                run1.m.delete()
+                continue
             for run2 in CommitRunDoc.m.find(dict(
                     commit_ids=run1.commit_ids[0])):
                 if run1._id == run2._id: continue
@@ -257,7 +289,7 @@ def unknown_commit_ids(all_commit_ids):
 
 def compute_diffs(repo_id, tree_cache, rhs_ci):
     '''compute simple differences between a commit and its first parent'''
-    if rhs_ci.tree_id is None: return
+    if rhs_ci.tree_id is None: return tree_cache
     def _walk_tree(tree, tree_index):
         for x in tree.blob_ids: yield x.id
         for x in tree.other_ids: yield x.id
@@ -295,26 +327,10 @@ def compute_diffs(repo_id, tree_cache, rhs_ci):
     for name, lhs_id, rhs_id in _diff_trees(lhs_tree, rhs_tree, tree_index):
         differences.append(
             dict(name=name, lhs_id=lhs_id, rhs_id=rhs_id))
-        # Set last commit info
-        if rhs_id is not None:
-            set_last_commit(repo_id, rhs_id, commit_info)
-        rhs_tree = tree_index.get(rhs_id, None)
-        if rhs_tree is not None:
-            for oid in _walk_tree(rhs_tree, tree_index):
-                set_last_commit(repo_id, oid, commit_info)
-    # Set last commit data for trees without it in the RHS
-    if True:
-        last_commit_collection = LastCommitDoc.m.session.db[
-            LastCommitDoc.m.collection_name]
-        last_commits = set(
-            d['object_id']
-            for d in last_commit_collection.find(
-                dict(object_id={'$in': rhs_tree_ids}),
-                { 'object_id': 1, '_id': 0 }))
-        for tree_id in rhs_tree_ids:
-            if tree_id not in last_commits:
-                set_last_commit(repo_id, tree_id, commit_info)
-   # Build the diffinfo
+    # Set last commit data
+    rhs_tree = tree_index[rhs_ci.tree_id]
+    refresh_last_commit(repo_id, '/', rhs_tree, lhs_tree, None, commit_info)
+    # Build the diffinfo
     di = DiffInfoDoc(dict(
             _id=rhs_ci._id,
             differences=differences))
@@ -415,7 +431,8 @@ def _diff_trees(lhs, rhs, index, *path):
 def get_commit_info(commit):
     if not isinstance(commit, Commit):
         commit = mapper(Commit).create(commit, dict(instrument=False))
-    session(commit).expunge(commit)
+    sess = session(commit)
+    if sess: sess.expunge(commit)
     return dict(
         id=commit._id,
         author=commit.authored.name,
@@ -426,10 +443,63 @@ def get_commit_info(commit):
         summary=commit.summary
         )
 
-def set_last_commit(repo_id, oid, commit_info):
+def refresh_last_commit(repo_id, path, tree, lhs_tree, parent_tree, commit_info):
+    '''Build the LastCommit info.
+
+    We only need to create LastCommit info for objects that are in the
+    RHS but not in the LHS, because only those objects are only ones
+    who have had anything changed in them.  (If file x/y/z.txt changes,
+    then it's hash will change, which also forces the hash for tree x/y
+    to change, as well as the hash for tree x.  So as long as an object's
+    hash isn't in the LHS, it means it's new or modified in this commit.)
+
+    In order to uniquely identify the tree or blob that a LastCommitDoc is
+    for, the tree or blob hash is not sufficient; we also need to know
+    either it's full path name, or it's parent tree and name.  Because of
+    this, we have to walk down the commit tree.'''
+    if lhs_tree is not None and tree._id == lhs_tree._id:
+        # tree was not changed in this commit (nor was anything under it)
+        return
+
+    # map LHS entries for easy lookup
+    lhs_map = {}
+    if lhs_tree:
+        for lhs_child in chain(lhs_tree.tree_ids, lhs_tree.blob_ids, lhs_tree.other_ids):
+            lhs_map[lhs_child.name] = lhs_child.id
+
+    # update our children
+    for child in chain(tree.tree_ids, tree.blob_ids, tree.other_ids):
+        if child.id != lhs_map.get(child.name, None):  # check if changed in this commit
+            lc = set_last_commit(repo_id, path, child.name, child.id, commit_info)
+
+    # (re)curse at our child trees
+    for child_tree in tree.tree_ids:
+        child_name = child_tree.name
+        child_tree = TreeDoc.m.get(_id=child_tree.id)
+        lhs_child = None
+        if child_name in lhs_map:
+            lhs_child = TreeDoc.m.get(_id=lhs_map[child_name])
+        refresh_last_commit(repo_id, path + child_name + '/', child_tree, lhs_child, tree, commit_info)
+
+def set_last_commit(repo_id, path, name, oid, commit_info):
     lc = LastCommitDoc(dict(
-            _id='%s:%s' % (repo_id, oid),
+            _id='%s:%s:%s' % (repo_id, path, name),
             object_id=oid,
+            name=name,
             commit_info=commit_info))
     lc.m.save(safe=False, upsert=True)
     return lc
+
+def last_known_commit_id(all_commit_ids, new_commit_ids):
+    """
+    Return the newest "known" (cached in mongo) commit id.
+
+    Params:
+        all_commit_ids: Every commit id from the repo on disk, sorted oldest to
+                        newest.
+        new_commit_ids: Commit ids that are not yet cached in mongo, sorted
+                        oldest to newest.
+    """
+    if not all_commit_ids: return None
+    if not new_commit_ids: return all_commit_ids[-1]
+    return all_commit_ids[all_commit_ids.index(new_commit_ids[0]) - 1]

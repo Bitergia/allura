@@ -1,4 +1,5 @@
 from os import path
+from mock import Mock, patch
 
 from pylons import c
 from nose.tools import eq_, assert_equals
@@ -21,6 +22,9 @@ def test_really_unicode():
     assert isinstance(s, unicode)
     # try non-ascii string in legacy 8bit encoding
     h.really_unicode(u'\u0410\u0401'.encode('cp1251'))
+    # ensure invalid encodings are handled gracefully
+    s = h._attempt_encodings('foo', ['LKDJFLDK'])
+    assert isinstance(s, unicode)
 
 def test_render_genshi_plaintext():
     here_dir = path.dirname(__file__)
@@ -122,6 +126,40 @@ def test_render_any_markup_plain():
                   '<pre>&lt;b&gt;blah&lt;/b&gt;\n&lt;script&gt;alert(1)&lt;/script&gt;\nfoo</pre>')
 
 def test_render_any_markup_formatting():
-    assert_equals(h.render_any_markup('README.md', '### foo\n<script>alert(1)</script> bar'),
-                  '<h3>foo</h3>\n<p>&lt;script&gt;alert(1)&lt;/script&gt; bar</p>')
+    assert_equals(h.render_any_markup('README.md', '### foo\n'
+                                      '    <script>alert(1)</script> bar'),
+                  '<div class="markdown_content"><h3 id="foo">foo</h3>\n'
+                  '<div class="codehilite"><pre><span class="nt">'
+                  '&lt;script&gt;</span>alert(1)<span class="nt">'
+                  '&lt;/script&gt;</span> bar\n</pre></div>\n</div>')
 
+
+class AuditLogMock(Mock):
+    logs = list()
+
+    @classmethod
+    def log(cls, message):
+        cls.logs.append(message)
+
+
+@patch('allura.model.AuditLog', new=AuditLogMock)
+def test_log_if_changed():
+    artifact = Mock()
+    artifact.value = 'test'
+    # change
+    h.log_if_changed(artifact, 'value', 'changed', 'updated value')
+    assert artifact.value == 'changed'
+    assert len(AuditLogMock.logs) == 1
+    assert AuditLogMock.logs[0] == 'updated value'
+
+    # don't change
+    h.log_if_changed(artifact, 'value', 'changed', 'updated value')
+    assert artifact.value == 'changed'
+    assert len(AuditLogMock.logs) == 1
+    assert AuditLogMock.logs[0] == 'updated value'
+
+
+def test_get_tool_package():
+    assert h.get_tool_package('tickets') == 'forgetracker'
+    assert h.get_tool_package('Wiki') == 'forgewiki'
+    assert h.get_tool_package('wrong_tool') == ''
