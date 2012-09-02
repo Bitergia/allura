@@ -10,6 +10,7 @@ from ming.orm import ThreadLocalORMSession
 from alluratest.controller import setup_basic_test, setup_global_objects
 from allura.lib import helpers as h
 from allura.tests import decorators as td
+from allura.tests.model.test_repo import RepoImplTestBase
 from allura import model as M
 from forgehg import model as HM
 
@@ -54,13 +55,13 @@ class TestNewRepo(unittest.TestCase):
         self.rev.committer_url
         assert self.rev.tree._id == self.rev.tree_id
         assert self.rev.summary == self.rev.message.splitlines()[0]
-        assert self.rev.shorthand_id() == '[1c7eb5]'
+        assert self.rev.shorthand_id() == '[4a7f7e]'
         assert self.rev.symbolic_ids == (['default'], ['tip'])
         assert self.rev.url() == (
             '/p/test/src-hg/ci/'
-            '1c7eb55bbd66ff45906b4a25d4b403899e0ffff1/')
+            '4a7f7ec0dcf5f005eb5d177b3d8c00bfc8159843/')
         all_cis = self.rev.log(0, 1000)
-        assert len(all_cis) == 4
+        assert len(all_cis) == 5
         assert self.rev.log(1,1000) == all_cis[1:]
         assert self.rev.log(0,3) == all_cis[:3]
         assert self.rev.log(1,2) == all_cis[1:3]
@@ -73,12 +74,12 @@ class TestNewRepo(unittest.TestCase):
         assert self.rev.tree.path() == '/'
         assert self.rev.tree.url() == (
             '/p/test/src-hg/ci/'
-            '1c7eb55bbd66ff45906b4a25d4b403899e0ffff1/'
+            '4a7f7ec0dcf5f005eb5d177b3d8c00bfc8159843/'
             'tree/')
         self.rev.tree.by_name['README']
         assert self.rev.tree.is_blob('README') == True
 
-class TestHgRepo(unittest.TestCase):
+class TestHgRepo(unittest.TestCase, RepoImplTestBase):
 
     def setUp(self):
         setup_basic_test()
@@ -151,40 +152,6 @@ class TestHgRepo(unittest.TestCase):
             self.repo.commit('HEAD')
             q.get.assert_called_with(_id='deadbeef')
 
-    def test_commit_run(self):
-        M.repo.CommitRunDoc.m.remove()
-        commit_ids = list(self.repo.all_commit_ids())
-        # simulate building up a commit run from multiple pushes
-        for c_id in commit_ids:
-            crb = M.repo_refresh.CommitRunBuilder([c_id])
-            crb.run()
-            crb.cleanup()
-        runs = M.repo.CommitRunDoc.m.find().all()
-        self.assertEqual(len(runs), 1)
-        run = runs[0]
-        self.assertEqual(run.commit_ids, list(reversed(commit_ids)))
-        self.assertEqual(len(run.commit_ids), len(run.commit_times))
-        self.assertEqual(run.parent_commit_ids, [])
-
-    def test_repair_commit_run(self):
-        commit_ids = list(self.repo.all_commit_ids())
-        # simulate building up a commit run from multiple pushes, but skip the
-        # last commit to simulate a broken commit run
-        for c_id in commit_ids[:-1]:
-            crb = M.repo_refresh.CommitRunBuilder([c_id])
-            crb.run()
-            crb.cleanup()
-        # now repair the commitrun by rebuilding with all commit ids
-        crb = M.repo_refresh.CommitRunBuilder(commit_ids)
-        crb.run()
-        crb.cleanup()
-        runs = M.repo.CommitRunDoc.m.find().all()
-        self.assertEqual(len(runs), 1)
-        run = runs[0]
-        self.assertEqual(run.commit_ids, list(reversed(commit_ids)))
-        self.assertEqual(len(run.commit_ids), len(run.commit_times))
-        self.assertEqual(run.parent_commit_ids, [])
-
 class TestHgCommit(unittest.TestCase):
 
     def setUp(self):
@@ -219,7 +186,7 @@ class TestHgCommit(unittest.TestCase):
         self.assertEqual(old_tree._id, new_tree._id)
 
     def test_url(self):
-        assert self.rev.url().endswith('0ffff1/'), \
+        assert self.rev.url().endswith('159843/'), \
             self.rev.url()
 
     def test_committer_url(self):

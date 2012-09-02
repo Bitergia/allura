@@ -11,6 +11,8 @@
   {{c.metadata_admin.display(value=c.project,
                              show_export_control=show_export_control,
                              allow_project_delete=allow_project_delete)}}
+
+  {{c.explain_export_modal.display(content=explain_export_text)}}
 {% endblock %}
 
 {% block extra_js %}
@@ -90,6 +92,29 @@
         }
         {% endif %}
       });
+      // export control functionality
+      var $export_details = $('#export_details');
+      var $export_controlled = $('#export_controlled');
+      var $export_control_type = $('input[name=export_control_type]');
+      var $export_warning = $('#export_warning');
+      $export_controlled.change(function(){
+        if($export_controlled.is(':checked')){
+          $export_details.show();
+          $export_control_type.change();
+        }
+        else{
+          $export_details.hide();
+          $export_warning.hide();
+        }
+      });
+      $export_control_type.change(function(evt){
+        var $targ = jQuery(evt.target);
+        if ($targ.is(':checked') && $targ.val() === 'more_than_25') {
+          $export_warning.show();
+        } else {
+          $export_warning.hide();
+        }
+      }).change();
     });
   </script>
 {% endblock %}
@@ -107,4 +132,3 @@
     }
   </style>
 {% endblock %}
-

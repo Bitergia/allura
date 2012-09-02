@@ -113,6 +113,7 @@ class Project(MappedClass, ActivityNode, ActivityObject):
             'parent_id',
             ('deleted', 'shortname', 'neighborhood_id'),
             ('neighborhood_id', 'is_nbhd_project', 'deleted')]
+        unique_indexes = [('neighborhood_id', 'shortname')]
         extensions = [ ProjectMapperExtension ]
 
     # Project schema
@@ -135,6 +136,7 @@ class Project(MappedClass, ActivityNode, ActivityObject):
     moved_to_url=FieldProperty(str, if_missing='')
     removal_changed_date = FieldProperty(datetime, if_missing=datetime.utcnow)
     export_controlled=FieldProperty(bool, if_missing=False)
+    export_control_type=FieldProperty(str, if_missing=None)
     database=FieldProperty(S.Deprecated)
     database_uri=FieldProperty(str)
     is_root=FieldProperty(bool)
@@ -465,6 +467,10 @@ class Project(MappedClass, ActivityNode, ActivityObject):
                 mount_point = base_mount_point + '-%d' % x
         if not h.re_path_portion.match(mount_point):
             raise exceptions.ToolError, 'Mount point "%s" is invalid' % mount_point
+        # HACK: reserved url components
+        if mount_point in ('feed', 'index', 'icon', '_nav.json'):
+            raise exceptions.ToolError, (
+                'Mount point "%s" is reserved' % mount_point)
         if self.app_instance(mount_point) is not None:
             raise exceptions.ToolError, (
                 'Mount point "%s" is already in use' % mount_point)

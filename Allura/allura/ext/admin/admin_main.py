@@ -32,6 +32,7 @@ class W:
     mount_delete = ffw.Lightbox(name='mount_delete',trigger='a.mount_delete')
     admin_modal = ffw.Lightbox(name='admin_modal',trigger='a.admin_modal')
     install_modal = ffw.Lightbox(name='install_modal',trigger='a.install_trig')
+    explain_export_modal = ffw.Lightbox(name='explain_export',trigger='#why_export')
     group_card = aw.GroupCard()
     permission_card = aw.PermissionCard()
     group_settings = aw.GroupSettings()
@@ -127,9 +128,6 @@ class AdminApp(Application):
     def install(self, project):
         pass
 
-    def uninstall(self, project): # pragma no cover
-        pass
-
 class ProjectAdminController(BaseController):
 
     def _check_security(self):
@@ -155,10 +153,20 @@ class ProjectAdminController(BaseController):
     def overview(self, **kw):
         c.markdown_editor = W.markdown_editor
         c.metadata_admin = W.metadata_admin
+        c.explain_export_modal = W.explain_export_modal
         show_export_control = asbool(config.get('show_export_control', False))
         allow_project_delete = asbool(config.get('allow_project_delete', True))
+        explain_export_text = '''The purpose of this section is to determine whether your project is subject to the provisions of the
+        US Export Administration Regulations. You should consult section 734.4 and Supplement 2 to Part 734 for information on such items
+        and the calculation of U.S. controlled content.
+        <a href="http://www.bis.doc.gov/encryption/default.htm" target="_blank">http://www.bis.doc.gov/encryption/default.htm</a>'''
+        if 'us_export_contact' in config:
+            explain_export_text += 'If you have additional questions, please contact <a href="mailto:{contact}">{contact}</a>.'.format(
+                contact=config['us_export_contact']
+            )
         return dict(show_export_control=show_export_control,
-                    allow_project_delete=allow_project_delete)
+                    allow_project_delete=allow_project_delete,
+                    explain_export_text=explain_export_text)
 
     @without_trailing_slash
     @expose('jinja:allura.ext.admin:templates/project_screenshots.html')
@@ -254,6 +262,7 @@ class ProjectAdminController(BaseController):
                removal='',
                moved_to_url='',
                export_controlled=False,
+               export_control_type=None,
                tracking_id='',
                **kw):
         require_access(c.project, 'update')
@@ -318,6 +327,12 @@ class ProjectAdminController(BaseController):
             h.log_action(log, 'change project export controlled status').info('')
             M.AuditLog.log('change project export controlled status to %s', export_controlled)
             c.project.export_controlled = not not export_controlled
+            if not export_controlled:
+                export_control_type = None
+        if export_control_type != c.project.export_control_type:
+            h.log_action(log, 'change project export control type').info('')
+            M.AuditLog.log('change project export control type to %s', export_control_type)
+            c.project.export_control_type = export_control_type
         if tracking_id != c.project.tracking_id:
             h.log_action(log, 'change project tracking ID').info('')
             M.AuditLog.log('change project tracking ID to %s', tracking_id)

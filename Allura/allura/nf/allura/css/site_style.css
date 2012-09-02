@@ -2382,7 +2382,14 @@ div.attachment_thumb .file_type span {
 }
 .discussion-post p, #new_post_holder p {
   padding: 0;
+  word-wrap: break-word;
 }
+
+.grid-2.gravatar {
+  width: 70px;
+  margin: 0 5px;
+}
+
 .discussion-post h4, #new_post_holder h4 {
   padding-left: 0;
 }
