@@ -28,6 +28,7 @@ from allura.lib.widgets.repo import SCMMergeRequestWidget, SCMMergeRequestFilter
 from allura.lib.widgets.repo import SCMMergeRequestDisposeWidget, SCMCommitBrowserWidget
 from allura import model as M
 from allura.lib.widgets import form_fields as ffw
+from allura.controllers.base import DispatchIndex
 
 from .base import BaseController
 
@@ -422,14 +423,16 @@ class CommitBrowser(BaseController):
 
     @expose('jinja:allura:templates/repo/log.html')
     @with_trailing_slash
-    def log(self, limit=None, page=0, count=0, **kw):
-        limit, page, start = g.handle_paging(limit, page)
+    @validate(dict(page=validators.Int(if_empty=0),
+                   limit=validators.Int(if_empty=25)))
+    def log(self, limit=25, page=0, **kw):
+        limit, page, start = g.handle_paging(limit, page, default=25)
         revisions = c.app.repo.log(
                 branch=self._commit._id,
                 offset=start,
                 limit=limit)
+        count = c.app.repo.count(branch=self._commit._id)
         c.log_widget = self.log_widget
-        count = 0
         return dict(
             username=c.user._id and c.user.username,
             branch=None,
@@ -439,7 +442,7 @@ class CommitBrowser(BaseController):
             count=count,
             **kw)
 
-class TreeBrowser(BaseController):
+class TreeBrowser(BaseController, DispatchIndex):
     tree_widget = SCMTreeWidget()
     FileBrowserClass=None
 

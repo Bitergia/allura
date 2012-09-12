@@ -1,9 +1,11 @@
 from nose.tools import assert_raises
+from datadiff.tools import assert_equal
 from ming.orm import ThreadLocalORMSession
+from mock import Mock, call
 
 from alluratest.controller import setup_basic_test, setup_global_objects
 from allura.command import script, set_neighborhood_features, \
-                           create_neighborhood
+                           create_neighborhood, show_models
 from allura import model as M
 from forgeblog import model as BM
 from allura.lib.exceptions import InvalidNBFeatureValueError
@@ -121,3 +123,66 @@ def test_update_neighborhood():
     ThreadLocalORMSession.close_all() # make sure the app_configs get freshly queried
     nb = M.Neighborhood.query.get(name='Projects')
     assert nb.has_home_tool == False
+
+
+class TestEnsureIndexCommand(object):
+
+    def test_run(self):
+        cmd = show_models.EnsureIndexCommand('ensure_index')
+        cmd.run([test_config])
+
+    def test_update_indexes_order(self):
+        collection = Mock(name='collection')
+        collection.index_information.return_value = {
+                '_id_': {'key': '_id'},
+                '_foo_bar': {'key': [('foo', 1), ('bar', 1)]},
+                }
+        indexes = [
+                Mock(unique=False, index_spec=[('foo', 1)]),
+                ]
+        cmd = show_models.EnsureIndexCommand('ensure_index')
+        cmd._update_indexes(collection, indexes)
+
+        collection_call_order = {}
+        for i, call in enumerate(collection.mock_calls):
+            method_name = call[0]
+            collection_call_order[method_name] = i
+        assert collection_call_order['ensure_index'] < collection_call_order['drop_index'], collection.mock_calls
+
+    def test_update_indexes_unique_changes(self):
+        collection = Mock(name='collection')
+        # expecting these ensure_index calls, we'll make their return values normal
+        # for easier assertions later
+        collection.ensure_index.side_effect = ['_foo_bar_temporary_extra_field_for_indexing',
+                                               '_foo_bar',
+                                               '_foo_baz_temporary_extra_field_for_indexing',
+                                               '_foo_baz',
+                                               '_foo_baz',
+                                               '_foo_bar',
+                                               ]
+        collection.index_information.return_value = {
+                '_id_': {'key': '_id'},
+                '_foo_bar': {'key': [('foo', 1), ('bar', 1)], 'unique': True},
+                '_foo_baz': {'key': [('foo', 1), ('baz', 1)]},
+                }
+        indexes = [
+                Mock(index_spec=[('foo', 1), ('bar', 1)], unique=False, ),
+                Mock(index_spec=[('foo', 1), ('baz', 1)], unique=True, ),
+                ]
+
+        cmd = show_models.EnsureIndexCommand('ensure_index')
+        cmd._update_indexes(collection, indexes)
+
+        assert_equal(collection.mock_calls, [
+            call.index_information(),
+            call.ensure_index([('foo', 1), ('bar', 1), ('temporary_extra_field_for_indexing', 1)]),
+            call.drop_index('_foo_bar'),
+            call.ensure_index([('foo', 1), ('bar', 1)], unique=False),
+            call.drop_index('_foo_bar_temporary_extra_field_for_indexing'),
+            call.ensure_index([('foo', 1), ('baz', 1), ('temporary_extra_field_for_indexing', 1)]),
+            call.drop_index('_foo_baz'),
+            call.ensure_index([('foo', 1), ('baz', 1)], unique=True),
+            call.drop_index('_foo_baz_temporary_extra_field_for_indexing'),
+            call.ensure_index([('foo', 1), ('baz', 1)], unique=True),
+            call.ensure_index([('foo', 1), ('bar', 1)], background=True)
+        ])
