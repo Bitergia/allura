@@ -36,7 +36,7 @@ from allura.lib.decorators import exceptionless
 from allura.lib import AsciiDammit
 from .security import has_access
 
-re_path_portion_fragment = re.compile(r'[a-z][-a-z0-9]{2,}')
+re_path_portion_fragment = re.compile(r'[a-z][-a-z0-9]*')
 re_path_portion = re.compile(r'^[a-z][-a-z0-9]{2,}$')
 re_clean_vardec_key = re.compile(r'''\A
 ( # first part
@@ -425,6 +425,7 @@ def pop_user_notifications(user=None):
     if mbox:
         notifications = M.Notification.query.find(dict(_id={'$in':mbox.queue}))
         mbox.queue = []
+        mbox.queue_empty = True
         for n in notifications:
             M.Notification.query.remove({'_id': n._id}) # clean it up so it doesn't hang around
             yield n

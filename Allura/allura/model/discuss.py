@@ -2,12 +2,14 @@ import logging
 from datetime import datetime
 
 import pymongo
+from pymongo.errors import DuplicateKeyError
 from pylons import c, g
 
 from ming import schema
 from ming.orm.base import session
 from ming.orm.property import (FieldProperty, RelationProperty,
                                ForeignIdProperty)
+from ming.utils import LazyProperty
 
 from allura.lib import helpers as h
 from allura.lib import security
@@ -68,10 +70,15 @@ class Discussion(Artifact, ActivityObject):
         self.num_posts = self.post_class().query.find(
             dict(discussion_id=self._id, status='ok')).count()
 
-    @property
+    @LazyProperty
     def last_post(self):
         q = self.post_class().query.find(dict(
-                discussion_id=self._id)).sort('timestamp', pymongo.DESCENDING)
+                discussion_id=self._id))\
+            .sort('timestamp', pymongo.DESCENDING)\
+            .limit(1)\
+            .hint([('discussion_id', pymongo.ASCENDING)])
+            # hint is to try to force the index to be used, since mongo wouldn't select it sometimes
+            # https://groups.google.com/forum/#!topic/mongodb-user/0TEqPfXxQU8
         return q.first()
 
     def url(self):
@@ -147,6 +154,21 @@ class Thread(Artifact, ActivityObject):
 
     def parent_security_context(self):
         return self.discussion
+
+    @classmethod
+    def new(cls, **props):
+        '''Creates a new Thread instance, ensuring a unique _id.'''
+        for i in range(5):
+            try:
+                thread = cls(**props)
+                session(thread).flush(thread)
+                return thread
+            except DuplicateKeyError as err:
+                log.warning('Got DuplicateKeyError: attempt #%s, trying again. %s', i, err)
+                if i == 4:
+                    raise
+                session(thread).expunge(thread)
+                continue
 
     @classmethod
     def discussion_class(cls):
@@ -273,9 +295,6 @@ class Thread(Artifact, ActivityObject):
 
     def query_posts(self, page=None, limit=None,
                     timestamp=None, style='threaded'):
-        if limit is None:
-            limit = 50
-        limit = int(limit)
         if timestamp:
             terms = dict(discussion_id=self.discussion_id, thread_id=self._id,
                     status={'$in': ['ok', 'pending']}, timestamp=timestamp)
@@ -287,9 +306,10 @@ class Thread(Artifact, ActivityObject):
             q = q.sort('full_slug')
         else:
             q = q.sort('timestamp')
-        if page is not None:
-            q = q.skip(page * limit)
         if limit is not None:
+            limit = int(limit)
+            if page is not None:
+                q = q.skip(page * limit)
             q = q.limit(limit)
         return q
 
@@ -489,6 +509,43 @@ class Post(Message, VersionedArtifact, ActivityObject):
         else:  # pragma no cover
             return None
 
+    def url_paginated(self):
+        '''Return link to the thread with a #target that poins to this comment.
+
+        Also handle pagination properly.
+        '''
+        if not self.thread:  # pragma no cover
+            return None
+        limit, p, s = g.handle_paging(None, 0)  # get paging limit
+        if self.query.find(dict(thread_id=self.thread._id)).count() <= limit:
+            # all posts in a single page
+            page = 0
+        else:
+            posts = self.thread.find_posts()
+            posts = self.thread.create_post_threads(posts)
+
+            def find_i(posts):
+                '''Find the index number of this post in the display order'''
+                q = []
+                def traverse(posts):
+                    for p in posts:
+                        if p['post']._id == self._id:
+                            return True  # found
+                        q.append(p)
+                        if traverse(p['children']):
+                            return True
+                traverse(posts)
+                return len(q)
+
+            page = find_i(posts) / limit
+
+        slug = h.urlquote(self.slug)
+        url = self.thread.url()
+        if page == 0:
+            return '%s?limit=%s#%s' % (url, limit, slug)
+        return '%s?limit=%s&page=%s#%s' % (url, limit, page, slug)
+
+
     def shorthand_id(self):
         if self.thread:
             return '%s#%s' % (self.thread.shorthand_id(), self.slug)
@@ -535,12 +592,15 @@ class Post(Message, VersionedArtifact, ActivityObject):
                     related_nodes=[self.app_config.project])
 
     def notify(self, file_info=None, check_dup=False):
+        if self.project.notifications_disabled:
+            return  # notifications disabled for entire project
         artifact = self.thread.artifact or self.thread
         n = Notification.query.get(
             _id=artifact.url() + self._id) if check_dup else None
         if not n:
             n = Notification.post(artifact, 'message', post=self,
                                   file_info=file_info)
+        if not n: return
         if (hasattr(artifact, "monitoring_email")
                 and artifact.monitoring_email):
             if hasattr(artifact, 'notify_post'):

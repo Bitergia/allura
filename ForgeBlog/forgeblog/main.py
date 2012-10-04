@@ -89,6 +89,9 @@ class ForgeBlogApp(Application):
             if globals is not None:
                 session(globals).flush()
 
+    def main_menu(self):
+        return [SitemapEntry(self.config.options.mount_label.title(), '.')]
+
     @property
     @h.exceptionless([], log)
     def sitemap(self):
@@ -216,7 +219,7 @@ class RootController(BaseController):
         post.neighborhood_id=c.project.neighborhood_id
         post.make_slug()
         post.commit()
-        M.Thread(discussion_id=post.app_config.discussion_id,
+        M.Thread.new(discussion_id=post.app_config.discussion_id,
                ref_id=post.index_id(),
                subject='%s discussion' % post.title)
         redirect(h.really_unicode(post.url()).encode('utf-8'))

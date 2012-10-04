@@ -12,16 +12,14 @@ from pylons import g, c, request
 from formencode import validators
 from webob import exc
 
-from ming.orm.base import session
 
-from allura.app import Application, ConfigOption, SitemapEntry, DefaultAdminController
 from allura.lib.security import require_access, has_access, require_authenticated
-from allura.model import ProjectRole, Feed
+from allura.model import Feed
 from allura.lib.search import search
 from allura.lib import helpers as h
 from allura.lib.utils import AntiSpam
 from allura.lib.decorators import require_post
-from allura.controllers import BaseController
+from allura.controllers import BaseController, DispatchIndex
 
 from .forum import ForumController
 from forgediscussion import import_support
@@ -35,7 +33,7 @@ from forgediscussion.widgets.admin import AddForumShort
 
 log = logging.getLogger(__name__)
 
-class RootController(BaseController):
+class RootController(BaseController, DispatchIndex):
 
     class W(object):
         forum_subscription_form=FW.ForumSubscriptionForm()
@@ -62,12 +60,7 @@ class RootController(BaseController):
                         app_config_id=c.app.config._id,
                         parent_id=None, deleted=False)).all()
         forums = [f for f in forums if h.has_access(f, 'read')()]
-        threads = dict()
-        for forum in forums:
-            threads[forum._id] = model.ForumThread.query.find(dict(
-                discussion_id=forum._id, num_replies={'$gt': 0})).sort('mod_date', pymongo.DESCENDING).limit(6).all()
         return dict(forums=forums,
-                    threads=threads,
                     announcements=announcements,
                     hide_forum=(not new_forum))
 
@@ -139,6 +132,13 @@ class RootController(BaseController):
                     '-deleted_b:true'])
             if results: count=results.hits
         c.search_results = self.W.search_results
+        if results is not None:
+            for doc in results:
+                if doc.get('type_s', '') == 'Post':
+                    _id = doc.get('id').split('#')
+                    _id = _id[-1].replace('/', '.') if _id else ''
+                    p = model.ForumPost.query.get(_id=_id)
+                    doc['url_paginated'] = p.url_paginated()
         return dict(q=q, history=history, results=results or [],
                     count=count, limit=limit, page=page)
 

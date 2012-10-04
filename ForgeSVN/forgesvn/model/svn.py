@@ -8,6 +8,7 @@ from subprocess import Popen, PIPE
 from hashlib import sha1
 from cStringIO import StringIO
 from datetime import datetime
+from glob import glob
 
 import tg
 import pysvn
@@ -25,6 +26,7 @@ from allura import model as M
 from allura.lib import helpers as h
 from allura.model.repository import GitLikeTree
 from allura.model.auth import User
+from allura.lib.utils import svn_path_exists
 
 log = logging.getLogger(__name__)
 
@@ -86,8 +88,14 @@ class SVNCalledProcessError(Exception):
 class SVNImplementation(M.RepositoryImplementation):
     post_receive_template = string.Template(
         '#!/bin/bash\n'
-        '# The following line is required for site integration, do not remove/modify\n'
-        'curl -s $url\n')
+        '# The following is required for site integration, do not remove/modify.\n'
+        '# Place user hook code in post-commit-user and it will be called from here.\n'
+        'curl -s $url\n'
+        '\n'
+        'DIR="$$(dirname "$${BASH_SOURCE[0]}")"\n'
+        'if [ -x $$DIR/post-commit-user ]; then'
+        '  exec $$DIR/post-commit-user "$$@"\n'
+        'fi')
 
     def __init__(self, repo):
         self._repo = repo
@@ -136,7 +144,7 @@ class SVNImplementation(M.RepositoryImplementation):
             self._repo._impl._svn.checkin([fullname+'/tmp/trunk',fullname+'/tmp/tags',fullname+'/tmp/branches'],'Initial commit')
             shutil.rmtree(fullname+'/tmp')
 
-    def clone_from(self, source_url):
+    def clone_from(self, source_url, copy_hooks=False):
         '''Initialize a repo as a clone of another using svnsync'''
         self.init(default_dirs=False, skip_special_files=True)
         # Need a pre-revprop-change hook for cloning
@@ -161,8 +169,13 @@ class SVNImplementation(M.RepositoryImplementation):
         check_call(['svnsync', 'init', self._url, source_url])
         check_call(['svnsync', '--non-interactive', 'sync', self._url])
         log.info('... %r cloned', self._repo)
+        if not svn_path_exists("file://%s%s/%s" %
+                         (self._repo.fs_path,
+                          self._repo.name,
+                          c.app.config.options['checkout_url'])):
+            c.app.config.options['checkout_url'] = ""
         self._repo.refresh(notify=False)
-        self._setup_special_files()
+        self._setup_special_files(source_url, copy_hooks)
 
     def refresh_heads(self):
         info = self._svn.info2(
@@ -407,8 +420,26 @@ class SVNImplementation(M.RepositoryImplementation):
 
         return size
 
-    def _setup_hooks(self):
+    def _copy_hooks(self, source_path):
+        '''Copy existing hooks if source path is given and exists.'''
+        if source_path is not None and source_path.startswith('file://'):
+            source_path = source_path[7:]
+        if source_path is None or not os.path.exists(source_path):
+            return
+        for hook in glob(os.path.join(source_path, 'hooks/*')):
+            filename = os.path.basename(hook)
+            target_filename = filename
+            if filename == 'post-commit':
+                target_filename = 'post-commit-user'
+            target = os.path.join(self._repo.full_fs_path, 'hooks', target_filename)
+            shutil.copy2(hook, target)
+
+    def _setup_hooks(self, source_path=None, copy_hooks=False):
         'Set up the post-commit and pre-revprop-change hooks'
+        if copy_hooks:
+            self._copy_hooks(source_path)
+        # setup a post-commit hook to notify Allura of changes to the repo
+        # the hook should also call the user-defined post-commit-user hook
         text = self.post_receive_template.substitute(
             url=tg.config.get('base_url', 'http://localhost:8080')
             + '/auth/refresh_repo' + self._repo.url())
@@ -416,10 +447,14 @@ class SVNImplementation(M.RepositoryImplementation):
         with open(fn, 'wb') as fp:
             fp.write(text)
         os.chmod(fn, 0755)
+        # create a blank pre-revprop-change file if one doesn't
+        # already exist to allow remote modification of revision
+        # properties (see http://svnbook.red-bean.com/en/1.1/ch05s02.html)
         fn = os.path.join(self._repo.fs_path, self._repo.name, 'hooks', 'pre-revprop-change')
-        with open(fn, 'wb') as fp:
-            fp.write('#!/bin/sh\n')
-        os.chmod(fn, 0755)
+        if not os.path.exists(fn):
+            with open(fn, 'wb') as fp:
+                fp.write('#!/bin/sh\n')
+            os.chmod(fn, 0755)
 
     def _revno(self, oid):
         return int(oid.split(':')[1])

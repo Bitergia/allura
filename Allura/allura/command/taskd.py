@@ -2,6 +2,8 @@ import os
 import time
 import Queue
 from datetime import datetime, timedelta
+import signal
+import sys
 
 import faulthandler
 import pylons
@@ -13,63 +15,104 @@ import base
 
 faulthandler.enable()
 
+
 class TaskdCommand(base.Command):
     summary = 'Task server'
     parser = base.Command.standard_parser(verbose=True)
-    parser.add_option('-p', '--proc', dest='proc', type='int', default=1,
-                      help='number of worker processes to spawn')
-    parser.add_option('--dry_run', dest='dry_run', action='store_true', default=False,
-                      help="get ready to run the task daemon, but don't actually run it")
+    parser.add_option('--only', dest='only', type='string', default=None,
+                      help='only handle tasks of the given name(s) (can be comma-separated list)')
+    parser.add_option('--exclude', dest='exclude', type='string', default=None,
+                      help='never handle tasks of the given name(s) (can be comma-separated list)')
 
     def command(self):
         self.basic_setup()
-        processes = [ ]
-        for x in xrange(self.options.proc):
-            processes.append(base.RestartableProcess(target=self.worker, log=base.log, ))
-        if self.options.dry_run: return
-        elif self.options.proc == 1:
-            base.log.info('Starting single taskd process')
-            self.worker()
-        else: # pragma no cover
-            for p in processes:
-                p.start()
-            while True:
-                for x in xrange(60):
-                    time.sleep(5)
-                    for p in processes: p.check()
-                base.log.info('=== Mark ===')
+        self.keep_running = True
+        self.restart_when_done = False
+        base.log.info('Starting taskd, pid %s' % os.getpid())
+        signal.signal(signal.SIGHUP, self.graceful_restart)
+        signal.signal(signal.SIGTERM, self.graceful_stop)
+        signal.signal(signal.SIGUSR1, self.log_current_task)
+        # restore default behavior of not interrupting system calls
+        # see http://docs.python.org/library/signal.html#signal.siginterrupt
+        # and http://linux.die.net/man/3/siginterrupt
+        signal.siginterrupt(signal.SIGHUP, False)
+        signal.siginterrupt(signal.SIGTERM, False)
+        signal.siginterrupt(signal.SIGUSR1, False)
+        self.worker()
+
+    def graceful_restart(self, signum, frame):
+        base.log.info('taskd pid %s recieved signal %s preparing to do a graceful restart' % (os.getpid(), signum))
+        self.keep_running = False
+        self.restart_when_done = True
+
+    def graceful_stop(self, signum, frame):
+        base.log.info('taskd pid %s recieved signal %s preparing to do a graceful stop' % (os.getpid(), signum))
+        self.keep_running = False
+
+    def log_current_task(self, signum, frame):
+        base.log.info('taskd pid %s is currently handling task %s' % (os.getpid(), getattr(self, 'task', None)))
 
     def worker(self):
         from allura import model as M
         name = '%s pid %s' % (os.uname()[1], os.getpid())
-        if self.options.dry_run: return
         wsgi_app = loadapp('config:%s#task' % self.args[0],relative_to=os.getcwd())
         poll_interval = asint(pylons.config.get('monq.poll_interval', 10))
+        only = self.options.only
+        if only:
+            only = only.split(',')
+        exclude = self.options.exclude
+        if exclude:
+            exclude = exclude.split(',')
+
         def start_response(status, headers, exc_info=None):
             pass
+
         def waitfunc_amqp():
             try:
                 return pylons.g.amq_conn.queue.get(timeout=poll_interval)
             except Queue.Empty:
                 return None
+
         def waitfunc_noq():
             time.sleep(poll_interval)
+
+        def check_running(func):
+            if self.keep_running:
+                return func()
+            else:
+                return None
+
         if pylons.g.amq_conn:
             waitfunc = waitfunc_amqp
         else:
             waitfunc = waitfunc_noq
-        while True:
+        waitfunc = check_running(waitfunc)
+        while self.keep_running:
             if pylons.g.amq_conn:
                 pylons.g.amq_conn.reset()
             try:
-                while True:
-                    task = M.MonQTask.get(process=name, waitfunc=waitfunc)
-                    # Build the (fake) request
-                    r = Request.blank('/--%s--/' % task.task_name, dict(task=task))
-                    list(wsgi_app(r.environ, start_response))
-            except Exception:
-                base.log.exception('Taskd, restart in 10s')
-                time.sleep(10)
+                while self.keep_running:
+                    self.task = M.MonQTask.get(
+                            process=name,
+                            waitfunc=waitfunc,
+                            only=only,
+                            exclude=exclude)
+                    if self.task:
+                        # Build the (fake) request
+                        r = Request.blank('/--%s--/' % self.task.task_name, dict(task=self.task))
+                        list(wsgi_app(r.environ, start_response))
+                        self.task = None
+            except Exception as e:
+                if self.keep_running:
+                    base.log.exception('taskd error %s; pausing for 10s before taking more tasks' % e)
+                    time.sleep(10)
+                else:
+                    base.log.exception('taskd error %s' % e)
+        base.log.info('taskd pid %s stopping gracefully.' % os.getpid())
+
+        if self.restart_when_done:
+            base.log.info('taskd pid %s restarting itself' % os.getpid())
+            os.execv(sys.argv[0], sys.argv)
 
 
 class TaskCommand(base.Command):

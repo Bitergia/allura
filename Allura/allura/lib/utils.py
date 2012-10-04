@@ -9,6 +9,7 @@ import datetime
 import random
 import mimetypes
 import re
+import magic
 from itertools import groupby
 
 import tg
@@ -25,6 +26,7 @@ from pygments.formatters import HtmlFormatter
 
 from ew import jinja2_ew as ew
 from ming.utils import LazyProperty
+import pysvn
 
 def permanent_redirect(url):
     try:
@@ -428,3 +430,26 @@ def generate_code_stats(blob):
     spaces = re.compile(r'^\s*$')
     stats['data_line_count'] = sum([1 for l in lines if not spaces.match(l)])
     return stats
+
+
+def svn_path_exists(path):
+    svn = pysvn.Client()
+    try:
+        svn.info2(path)
+        return True
+    except pysvn.ClientError, e:
+        return False
+
+
+def is_text_file(file):
+    msg = magic.from_buffer(file[:1024])
+    if ("text" in msg) or ("empty" in msg):
+        return True
+    return False
+
+
+def take_while_true(source):
+    x = source()
+    while x:
+        yield x
+        x = source()

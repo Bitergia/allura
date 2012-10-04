@@ -39,23 +39,21 @@ if (!Array.prototype.indexOf)
   };
 }
 if($('#commit_graph')){
-    var data;
-    var offset = 0;
-    var y_offset = 0;
-    var page_size = 14;
-    var limit = 14;
-    var tree, next_column, max_x_pos, max_row;
-
     // graph size settings
     var x_space = 10;
     var y_space = 20;
     var point_offset = 5;
     var point_size = 10;
+    var page_size = 15;
 
-    var $first = $('#first');
-    var $last = $('#last');
-    var $prev = $('#prev');
-    var $next = $('#next');
+    var data;
+    var offset = 1;
+    var selected_commit = -1;
+    var y_offset = offset * y_space;
+    var tree, next_column, max_x_pos, max_row;
+
+    var $graph_holder = $('#graph_holder');
+    var $scroll_placeholder = $('#graph_scroll_placeholder');
     var $canvas = $('#commit_graph');
     var $highlighter = $('#commit_highlighter');
     var highlighter = $highlighter[0];
@@ -64,14 +62,24 @@ if($('#commit_graph')){
     var canvas_ctx = canvas.getContext('2d');
 
     // graph set up
-    var height = (limit + 0.5) * y_space;
     var commit_rows = [];
     var taken_coords = {};
-    canvas.height=height;
 
-    // highlighter set up
-    highlighter.height=height;
+    canvas.height = 300;
+    highlighter.height = canvas.height;
     highlighter_ctx.fillStyle = "#ccc";
+
+    function setHeight(cnt) {
+      /*
+       * Set proper canvas height for cnt commits.
+       *
+       * There is a canvas height limit in all modern browsers (about 8k pixels).
+       * So we keep the canvas height small and redraw the canvas on scroll with needed part of commit graph.
+       * We need to keep placeholder of the needed height inside $graph_holder to enable default scrollbar.
+       */
+      graph_height = (cnt + .5) * y_space + 10;
+      $scroll_placeholder.height(graph_height);
+    }
 
     $.getJSON(document.location.href+'_data', function(data) {
         data = data;
@@ -79,6 +87,7 @@ if($('#commit_graph')){
         next_column = data['next_column'];
         max_x_pos = x_space*next_column;
         max_row = data['max_row']
+        setHeight(max_row);
 
         // Calculate the (x,y) positions of all the commits
         for(var c in tree){
@@ -96,58 +105,42 @@ if($('#commit_graph')){
                 x_pos: x_pos,
                 y_pos: y_pos }
         }
-        updateOffset(0);
-    });
-    updateOffset = function(x) {
-        console.log('Set offset to', x);
-        offset = x;
-        y_offset = x * y_space;
-        $first.removeClass('disabled');
-        $prev.removeClass('disabled');
-        $next.removeClass('disabled');
-        $last.removeClass('disabled');
-        if(offset <= 0) {
-            offset = 0;
-            $last.addClass('disabled');
-            $next.addClass('disabled');
-        }
-        else if(offset > (max_row-page_size)) {
-            offset = max_row - page_size;
-            $first.addClass('disabled');
-            $prev.addClass('disabled');
-        }
         drawGraph(offset);
-        return false;
-    };
-    $last.click(function() {
-        console.log('Last');
-        return updateOffset(0);
-    });
-    $next.click(function() {
-        console.log('Next');
-        return updateOffset(offset - page_size);
-    });
-    $prev.click(function() {
-        console.log('Prev');
-        return updateOffset(offset + page_size);
-    });
-    $first.click(function() {
-        console.log('First');
-        return updateOffset(max_row);
+        selectCommit(0);
     });
 
-    $canvas.click(function(evt) {
-        var y = Math.floor((evt.pageY-$canvas.offset().top) / y_space);
-        var commit = commit_rows[offset+y-1];
-        highlighter_ctx.clearRect(0, 0, canvas.width, canvas.height);
-        // active_ys = [commit.y_pos-y_space/4,y_space]
-        highlighter_ctx.fillRect(
-            0, (commit.y_pos - y_offset) - y_space/4,
-            750, y_space)
+    function selectCommit(index) {
+      if (index < 0 || index > max_row) return;
+      var commit = commit_rows[index];
+      highlighter_ctx.clearRect(0, 0, canvas.width, canvas.height);
+      highlighter_ctx.fillRect(
+          0, (commit.y_pos - y_offset) - y_space/4,
+          750, y_space)
+      if (selected_commit != index) {
+        $('#commit_view').html('<em>Loading commit details...</em>');
         $.get(commit.url+'basic',function(result){
             $('#commit_view').html(result);
         });
+      }
+      selected_commit = index;
+    }
+
+    $canvas.click(function(evt) {
+        var y = Math.floor((evt.pageY-$canvas.offset().top) / y_space);
+        selectCommit(offset+y-1);
     });
+
+    function color(index) {
+      /* choose color for colorblind users (according to http://jfly.iam.u-tokyo.ac.jp/color/#pallet) */
+      switch(index){
+        case 0: return "rgb(213,94,0)";
+        case 1: return "rgb(0,114,178)";
+        case 2: return "rgb(240,228,66)";
+        case 3: return "rgb(0,158,115)";
+        case 4: return "rgb(230,159,0)";
+        default: return "rgb(86,180,223)";
+      }
+    }
 
     function drawGraph(offset) {
         // Clear the canvas and set the contetx
@@ -170,25 +163,7 @@ if($('#commit_graph')){
                 var parent_x = x_space+parent.column*x_space
                 var parent_y = y_space+(parent.row-offset)*y_space;
 
-                switch(parent.column % 6){
-                case 0:
-                    canvas_ctx.strokeStyle = "#a00";
-                    break;
-                case 1:
-                    canvas_ctx.strokeStyle = "#0a0";
-                    break;
-                case 2:
-                    canvas_ctx.strokeStyle = "#00a";
-                    break;
-                case 3:
-                    canvas_ctx.strokeStyle = "#aa0";
-                    break;
-                case 4:
-                    canvas_ctx.strokeStyle = "#0aa";
-                    break;
-                default:
-                    canvas_ctx.strokeStyle = "#f0f";
-                }
+                canvas_ctx.strokeStyle = color(parent.column % 6);
 
                 // Vertical
                 canvas_ctx.beginPath();
@@ -210,26 +185,7 @@ if($('#commit_graph')){
             var x_pos = x_space+(commit.column*x_space);
             var y_pos = y_space+((commit.row-offset)*y_space);
 
-            switch(commit.column % 6){
-                case 0:
-                    canvas_ctx.strokeStyle = canvas_ctx.fillStyle = "#a00";
-                    break;
-                case 1:
-                    canvas_ctx.strokeStyle = canvas_ctx.fillStyle = "#0a0";
-                    break;
-                case 2:
-                    canvas_ctx.strokeStyle = canvas_ctx.fillStyle = "#00a";
-                    break;
-                case 3:
-                    canvas_ctx.strokeStyle = canvas_ctx.fillStyle = "#aa0";
-                    break;
-                case 4:
-                    canvas_ctx.strokeStyle = canvas_ctx.fillStyle = "#0aa";
-                    break;
-                default:
-                    canvas_ctx.strokeStyle = canvas_ctx.fillStyle = "#f0f";
-                }
-
+            canvas_ctx.strokeStyle = canvas_ctx.fillStyle = color(commit.column % 6);
             canvas_ctx.beginPath();
             canvas_ctx.arc(x_pos + point_offset, y_pos + point_offset, point_offset, 0, 2 * Math.PI, false);
             canvas_ctx.fill();
@@ -238,4 +194,23 @@ if($('#commit_graph')){
             canvas_ctx.fillText(commit.message, (1+next_column) * x_space, y_pos);
         }
     }
+
+    function setOffset(x) {
+      offset = Math.round(x);
+      if (offset < 1)
+        offset = 1;
+      else if (offset > (max_row - page_size))
+        offset = max_row - page_size + 2;
+      y_offset = offset * y_space;
+      drawGraph(offset);
+      if (selected_commit >= offset - 1 && selected_commit <= offset + page_size)
+        selectCommit(selected_commit);
+    }
+
+    $graph_holder.scroll(function() {
+      var y = $(this).scrollTop();
+      setOffset(y / y_space);
+      $canvas.css('top', y);
+      $highlighter.css('top', y);
+    });
 }

@@ -105,6 +105,20 @@ class TestRootController(SVNTestController):
         assert 'This is readme' in resp, resp.showbrowser()
         assert '+++' in resp, resp.showbrowser()
 
+    def test_checkout_svn(self):
+        self.app.post('/p/test/admin/src/set_checkout_url',
+                      {"checkout_url": "badurl"})
+        r = self.app.get('/p/test/admin/src/checkout_url')
+        assert 'value="trunk"' in r
+        self.app.post('/p/test/admin/src/set_checkout_url',
+                      {"checkout_url": ""})
+        r = self.app.get('/p/test/admin/src/checkout_url')
+        assert 'value="trunk"' not in r
+        self.app.post('/p/test/admin/src/set_checkout_url',
+                      {"checkout_url": "a"})
+        r = self.app.get('/p/test/admin/src/checkout_url')
+        assert 'value="a"' in r
+
 
 class TestImportController(SVNTestController):
     def test_index(self):

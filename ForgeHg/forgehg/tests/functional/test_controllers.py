@@ -116,14 +116,14 @@ class TestRootController(TestController):
     def test_commit_browser_data(self):
         resp = self.app.get('/src-hg/commit_browser_data')
         data = json.loads(resp.body);
-        assert data['max_row'] == 4
+        assert data['max_row'] == 5
         assert data['next_column'] == 1
         assert_equal(data['built_tree']['e5a0b44437be783c41084e7bf0740f9b58b96ecf'],
                 {u'url': u'/p/test/src-hg/ci/e5a0b44437be783c41084e7bf0740f9b58b96ecf/',
                  u'oid': u'e5a0b44437be783c41084e7bf0740f9b58b96ecf',
                  u'column': 0,
                  u'parents': [u'773d2f8e3a94d0d5872988b16533d67e1a7f5462'],
-                 u'message': u'Modify README', u'row': 3})
+                 u'message': u'Modify README', u'row': 4})
 
     def _get_ci(self):
         resp = self.app.get('/src-hg/').follow().follow()
@@ -140,7 +140,7 @@ class TestRootController(TestController):
     def test_tree(self):
         ci = self._get_ci()
         resp = self.app.get(ci + 'tree/')
-        assert len(resp.html.findAll('tr')) == 3, resp.showbrowser()
+        assert len(resp.html.findAll('tr')) == 4, resp.showbrowser()
         assert 'README' in resp, resp.showbrowser()
 
     def test_file(self):
@@ -167,10 +167,98 @@ class TestRootController(TestController):
         assert '+Another line' in resp, resp.showbrowser()
 
     def test_binary_diff(self):
-        ci = '/p/test/src-hg/ci/4a7f7ec0dcf5f005eb5d177b3d8c00bfc8159843/'
-        parent = '1c7eb55bbd66ff45906b4a25d4b403899e0ffff1'
-        resp = self.app.get(ci + 'tree/test.jpg?barediff=' + parent,
+        ci = '/p/test/src-hg/ci/5a0a993efa9bce7d1983344261393e841fcfd65d/'
+        parent = '4a7f7ec0dcf5f005eb5d177b3d8c00bfc8159843'
+        resp = self.app.get(ci + 'tree/bin_file?barediff=' + parent,
         validate_chunk=True)
         assert 'Cannot display: file marked as a binary type.' in resp
 
 
+class TestLogPagination(TestController):
+
+    def setUp(self):
+        TestController.setUp(self)
+        self.setup_with_tools()
+
+    @td.with_hg
+    def setup_with_tools(self):
+        h.set_context('test', 'src-hg', neighborhood='Projects')
+        repo_dir = pkg_resources.resource_filename(
+            'forgehg', 'tests/data')
+        c.app.repo.fs_path = repo_dir
+        c.app.repo.status = 'ready'
+        c.app.repo.name = 'paginationtest.hg'
+        c.app.repo.refresh()
+        ThreadLocalORMSession.flush_all()
+        ThreadLocalORMSession.close_all()
+        h.set_context('test', 'src-hg', neighborhood='Projects')
+        c.app.repo.refresh()
+
+    def _get_ci(self):
+        resp = self.app.get('/src-hg/').follow().follow()
+        for tag in resp.html.findAll('a'):
+            if tag['href'].startswith('/p/test/src-hg/ci/'):
+                return tag['href']
+        return None
+
+    def test_show_pagination(self):
+        resp = self.app.get(self._get_ci() + 'log/')
+        assert "pager_curpage" in resp
+        resp = self.app.get(self._get_ci() + 'log/?limit=50')
+        assert "pager_curpage" not in resp
+        resp = self.app.get(self._get_ci() + 'log/?page=2')
+        assert "pager_curpage" not in resp
+
+    def test_log_messages(self):
+        resp = self.app.get(self._get_ci() + 'log/')
+        # first commit is on the first page
+        assert "[0debe4]" in resp
+        # 25th commit is on the first page too
+        assert "[ab7517]" in resp
+        # 26th commit is not on the first page
+        assert "[dc406e]" not in resp
+        resp = self.app.get(self._get_ci() + 'log/?page=1')
+        assert "[0debe4]" not in resp
+        # 26th commit is on the second page
+        assert "[dc406e]" in resp
+
+        # test with greater limit
+        resp = self.app.get(self._get_ci() + 'log/?limit=50')
+        assert "[0debe4]" in resp
+        assert "[dc406e]" in resp
+
+
+class TestTreeLs(TestController):
+
+    def setUp(self):
+        TestController.setUp(self)
+        self.setup_with_tools()
+
+    @td.with_hg
+    def setup_with_tools(self):
+        h.set_context('test', 'src-hg', neighborhood='Projects')
+        repo_dir = pkg_resources.resource_filename(
+            'forgehg', 'tests/data')
+        c.app.repo.fs_path = repo_dir
+        c.app.repo.status = 'ready'
+        c.app.repo.name = 'testrepoforre.hg'
+        c.app.repo.refresh()
+        ThreadLocalORMSession.flush_all()
+        ThreadLocalORMSession.close_all()
+        h.set_context('test', 'src-hg', neighborhood='Projects')
+        c.app.repo.refresh()
+
+    def _get_ci(self):
+        resp = self.app.get('/src-hg/').follow().follow()
+        for tag in resp.html.findAll('a'):
+            if tag['href'].startswith('/p/test/src-hg/ci/'):
+                return tag['href']
+        return None
+
+    def test_tree_ls(self):
+        ci = self._get_ci()
+        for i in ['*', '%', '%3F', '+', '*', '%', '.', '~']:
+            r = self.app.get('%stree/test%stest/' % (ci, i))
+            assert 'test.txt' in r
+            r = self.app.get('%stree/test%stest/' % (ci, i + i))
+            assert 'test.txt' in r

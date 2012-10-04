@@ -11,7 +11,8 @@ from cStringIO import StringIO
 from random import randint
 from hashlib import sha256
 from base64 import b64encode
-from datetime import datetime
+from datetime import datetime, timedelta
+import json
 
 try:
     import ldap
@@ -22,6 +23,7 @@ import pkg_resources
 from tg import config, flash
 from pylons import g, c
 from webob import exc
+from bson.tz_util import FixedOffset
 
 from ming.utils import LazyProperty
 from ming.orm import state
@@ -334,6 +336,24 @@ class ProjectRegistrationProvider(object):
         '''
         return []
 
+    def rate_limit(self, user, neighborhood):
+        '''Check the various config-defined project registration rate
+        limits, and if any are exceeded, raise ProjectRatelimitError.
+        '''
+        if security.has_access(neighborhood, 'admin', user=user)():
+            return
+        # have to have the replace because, despite being UTC,
+        # the result from utcnow() is still offset-naive  :-(
+        # maybe look into making the mongo connection offset-naive?
+        now = datetime.utcnow().replace(tzinfo=FixedOffset(0, 'UTC'))
+        project_count = len(list(user.my_projects()))
+        rate_limits = json.loads(config.get('project.rate_limits', '{}'))
+        for rate, count in rate_limits.items():
+            user_age = now - user._id.generation_time
+            user_age = (user_age.microseconds + (user_age.seconds + user_age.days * 24 * 3600) * 10**6) / 10**6
+            if user_age < int(rate) and project_count >= count:
+                raise forge_exc.ProjectRatelimitError()
+
     def register_neighborhood_project(self, neighborhood, users, allow_register=False):
         from allura import model as M
         shortname='--init--'
@@ -391,6 +411,8 @@ class ProjectRegistrationProvider(object):
             log.exception('Error registering project %s' % project_name)
             raise forge_exc.ProjectOverlimitError()
 
+        self.rate_limit(user, neighborhood)
+
         if not h.re_path_portion.match(shortname.replace('/', '')):
             raise ValueError('Invalid project shortname: %s' % shortname)
         try:
@@ -434,9 +456,9 @@ class ProjectRegistrationProvider(object):
                         p.acl += [M.ACE.allow(group._id, perm)
                                 for perm in permissions]
                     for username in usernames:
-                        user = M.User.by_username(username)
-                        if not (user and user._id): continue
-                        pr = user.project_role(project=p)
+                        guser = M.User.by_username(username)
+                        if not (guser and guser._id): continue
+                        pr = guser.project_role(project=p)
                         if group._id not in pr.roles:
                             pr.roles.append(group._id)
             if 'tools' in project_template:
@@ -475,6 +497,9 @@ class ProjectRegistrationProvider(object):
                     project_template['icon']['filename'], icon_file,
                     square=True, thumbnail_size=(48, 48),
                     thumbnail_meta=dict(project_id=p._id, category='icon'))
+            # clear the RoleCache for the user so this project will
+            # be picked up by user.my_projects()
+            g.credentials.clear_user(user._id)
         except forge_exc.ProjectConflict:
             raise
         except:

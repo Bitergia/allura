@@ -10,7 +10,7 @@ from tg.decorators import with_trailing_slash, without_trailing_slash
 from webob import exc
 from bson import ObjectId
 
-from allura.app import Application, WidgetController, DefaultAdminController, SitemapEntry
+from allura.app import Application, DefaultAdminController, SitemapEntry
 from allura.lib import helpers as h
 from allura import version
 from allura import model as M
@@ -84,9 +84,7 @@ class AdminApp(Application):
         '''Apps should provide their entries to be added to the main nav
         :return: a list of :class:`SitemapEntries <allura.app.SitemapEntry>`
         '''
-        return [ SitemapEntry(
-                self.config.options.mount_label.title(),
-                '.')]
+        return [SitemapEntry('Admin', '.')]
 
     @h.exceptionless([], log)
     def sidebar_menu(self):

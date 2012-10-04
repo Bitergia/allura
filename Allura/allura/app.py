@@ -46,6 +46,16 @@ class SitemapEntry(object):
         self.children = children
 
     def __getitem__(self, x):
+        """
+        Automatically expand the list of sitemap child entries with the given items.  Example:
+            SitemapEntry('HelloForge')[
+                SitemapEntry('foo')[
+                    SitemapEntry('Pages')[pages]
+                ]
+            ]
+
+        TODO: deprecate this; use a more clear method of building a tree
+        """
         if isinstance(x, (list, tuple)):
             self.children.extend(list(x))
         else:
@@ -55,6 +65,7 @@ class SitemapEntry(object):
     def __repr__(self):
         l = ['<SitemapEntry ']
         l.append('    label=%r' % self.label)
+        l.append('    url=%r' % self.url)
         l.append('    children=%s' % repr(self.children).replace('\n', '\n    '))
         l.append('>')
         return '\n'.join(l)
@@ -81,13 +92,6 @@ class SitemapEntry(object):
                 self.children.append(e)
                 child_index[lbl] = e
 
-class WidgetController(BaseController):
-    widgets=[]
-
-    def __init__(self, app): pass
-
-    def portlet(self, content):
-        return '<div class="portlet">%s</div>' % content
 
 class Application(object):
     """
@@ -122,7 +126,6 @@ class Application(object):
     permissions=[]
     sitemap = [ ]
     installable=True
-    widget = WidgetController
     searchable = False
     DiscussionClass = model.Discussion
     PostClass = model.Post

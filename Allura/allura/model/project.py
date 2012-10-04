@@ -349,7 +349,7 @@ class Project(MappedClass, ActivityNode, ActivityObject):
                     ordinal = ac.options.get('ordinal', 0)
                     entry_index[ac.project_id].append({'ordinal':ordinal,'entry':entry})
 
-        sitemaps = dict((pid, SitemapEntry('root').children) for pid in pids)
+        sitemaps = dict((pid, []) for pid in pids)
         for pid, entries in entry_index.iteritems():
             entries.sort(key=lambda e:e['ordinal'])
             sitemap = sitemaps[pid]
@@ -385,7 +385,6 @@ class Project(MappedClass, ActivityNode, ActivityObject):
                                     exclude from sitemap
         """
         from allura.app import SitemapEntry
-        sitemap = SitemapEntry('root')
         entries = []
 
         # Set menu mode
@@ -408,7 +407,7 @@ class Project(MappedClass, ActivityNode, ActivityObject):
             App = ac.load()
             app = App(self, ac)
             if app.is_visible_to(c.user):
-                for sm in app.sitemap:
+                for sm in app.main_menu():
                     entry = sm.bind_app(app)
                     entry.ui_icon='tool-%s' % ac.tool_name.lower()
                     ordinal = int(ac.options.get('ordinal', 0)) + delta_ordinal
@@ -421,9 +420,7 @@ class Project(MappedClass, ActivityNode, ActivityObject):
             max_ordinal += 1
 
         entries = sorted(entries, key=lambda e: e['ordinal'])
-        for e in entries:
-            sitemap.children.append(e['entry'])
-        return sitemap.children
+        return [e['entry'] for e in entries]
 
     def parent_iter(self):
         yield self
@@ -580,11 +577,6 @@ class Project(MappedClass, ActivityNode, ActivityObject):
         for ac in self.app_configs:
             self.uninstall_app(ac.options.get('mount_point'))
         MappedClass.delete(self)
-
-    def render_widget(self, widget):
-        app = self.app_instance(widget['mount_point'])
-        with h.push_config(c, project=self, app=app):
-            return getattr(app.widget(app), widget['widget_name'])()
 
     def breadcrumbs(self):
         entry = ( self.name, self.url() )

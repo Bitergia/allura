@@ -7,6 +7,7 @@ from ming.orm import ThreadLocalORMSession
 
 from alluratest.controller import setup_basic_test, setup_global_objects
 from allura.lib import helpers as h
+from allura.lib.utils import svn_path_exists
 from allura.tests import decorators as td
 from allura.tests.model.test_repo import RepoImplTestBase
 from allura import model as M
@@ -106,6 +107,34 @@ class TestSVNRepo(unittest.TestCase, RepoImplTestBase):
         repo.init()
         shutil.rmtree(dirname)
 
+    def test_fork(self):
+        repo = SM.Repository(
+            name='testsvn',
+            fs_path='/tmp/',
+            url_path = '/test/',
+            tool = 'svn',
+            status = 'creating')
+        repo_path = pkg_resources.resource_filename(
+            'forgesvn', 'tests/data/testsvn')
+        dirname = os.path.join(repo.fs_path, repo.name)
+        if os.path.exists(dirname):
+            shutil.rmtree(dirname)
+        repo.init()
+        repo._impl.clone_from('file://' + repo_path, copy_hooks=False)
+        assert len(repo.log())
+        assert os.path.exists('/tmp/testsvn/hooks/pre-revprop-change')
+        assert os.access('/tmp/testsvn/hooks/pre-revprop-change', os.X_OK)
+        with open('/tmp/testsvn/hooks/pre-revprop-change') as f: c = f.read()
+        self.assertEqual(c, '#!/bin/sh\n')
+        assert not os.path.exists('/tmp/testsvn/hooks/post-revprop-change')
+        assert not os.path.exists('/tmp/testsvn/hooks/post-commit-user')
+        assert os.path.exists('/tmp/testsvn/hooks/post-commit')
+        assert os.access('/tmp/testsvn/hooks/post-commit', os.X_OK)
+        with open('/tmp/testsvn/hooks/post-commit') as f: c = f.read()
+        self.assertIn('curl -s http://localhost//auth/refresh_repo/p/test/src/\n', c)
+        self.assertIn('exec $DIR/post-commit-user "$@"\n', c)
+        shutil.rmtree(dirname)
+
     def test_clone(self):
         repo = SM.Repository(
             name='testsvn',
@@ -119,8 +148,25 @@ class TestSVNRepo(unittest.TestCase, RepoImplTestBase):
         if os.path.exists(dirname):
             shutil.rmtree(dirname)
         repo.init()
-        repo._impl.clone_from('file://' + repo_path)
+        repo._impl.clone_from('file://' + repo_path, copy_hooks=True)
         assert len(repo.log())
+        assert os.path.exists('/tmp/testsvn/hooks/pre-revprop-change')
+        assert os.access('/tmp/testsvn/hooks/pre-revprop-change', os.X_OK)
+        with open('/tmp/testsvn/hooks/pre-revprop-change') as f: c = f.read()
+        self.assertEqual(c, 'pre-revprop-change\n')
+        assert os.path.exists('/tmp/testsvn/hooks/post-revprop-change')
+        assert os.access('/tmp/testsvn/hooks/post-revprop-change', os.X_OK)
+        with open('/tmp/testsvn/hooks/post-revprop-change') as f: c = f.read()
+        self.assertEqual(c, 'post-revprop-change\n')
+        assert os.path.exists('/tmp/testsvn/hooks/post-commit-user')
+        assert os.access('/tmp/testsvn/hooks/post-commit-user', os.X_OK)
+        with open('/tmp/testsvn/hooks/post-commit-user') as f: c = f.read()
+        self.assertEqual(c, 'post-commit\n')
+        assert os.path.exists('/tmp/testsvn/hooks/post-commit')
+        assert os.access('/tmp/testsvn/hooks/post-commit', os.X_OK)
+        with open('/tmp/testsvn/hooks/post-commit') as f: c = f.read()
+        self.assertIn('curl -s http://localhost//auth/refresh_repo/p/test/src/\n', c)
+        self.assertIn('exec $DIR/post-commit-user "$@"\n', c)
         shutil.rmtree(dirname)
 
     def test_index(self):
@@ -178,6 +224,14 @@ class TestSVNRepo(unittest.TestCase, RepoImplTestBase):
         entry = self.repo.commit(1)
         assert entry.committed.name == 'rick446'
         assert entry.message
+
+    def test_svn_path_exists(self):
+        repo_path = pkg_resources.resource_filename(
+            'forgesvn', 'tests/data/testsvn')
+        assert svn_path_exists("file://%s/a" % repo_path)
+        assert svn_path_exists("file://%s" % repo_path)
+        assert not svn_path_exists("file://%s/badpath" % repo_path)
+
 
 class TestSVNRev(unittest.TestCase):
 

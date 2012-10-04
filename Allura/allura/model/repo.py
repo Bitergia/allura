@@ -378,6 +378,8 @@ class Tree(RepoObject):
     def get_obj_by_path(self, path):
         if hasattr(path, 'get'):
             path = path['new']
+        if path.startswith('/'):
+            path = path[1:]
         path = path.split('/')
         obj = self
         for p in path:
@@ -412,7 +414,9 @@ class Tree(RepoObject):
 
     def ls(self):
         # Load last commit info
-        id_re = re.compile("^{0}:{1}:".format(self.repo._id, h.really_unicode(self.path()).encode('utf-8')))
+        id_re = re.compile("^{0}:{1}:".format(
+            self.repo._id,
+            re.escape(h.really_unicode(self.path()).encode('utf-8'))))
         lc_index = dict(
             (lc.name, lc.commit_info)
             for lc in LastCommitDoc.m.find(dict(_id=id_re)))
@@ -552,8 +556,10 @@ class Blob(object):
 
     @property
     def has_html_view(self):
-        if self.content_type.startswith('text/') or self.extension in VIEWABLE_EXTENSIONS or \
-            self.extension in self.repo._additional_viewable_extensions:
+        if (self.content_type.startswith('text/') or
+            self.extension in VIEWABLE_EXTENSIONS or
+            self.extension in self.repo._additional_viewable_extensions or
+            utils.is_text_file(self.text)):
             return True
         return False
 

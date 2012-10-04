@@ -5,6 +5,7 @@ import logging
 import random
 from collections import namedtuple
 from datetime import datetime
+from glob import glob
 
 import tg
 import git
@@ -53,8 +54,14 @@ class Repository(M.Repository):
 class GitImplementation(M.RepositoryImplementation):
     post_receive_template = string.Template(
         '#!/bin/bash\n'
-        '# The following line is required for site integration, do not remove/modify\n'
-        'curl -s $url\n')
+        '# The following is required for site integration, do not remove/modify.\n'
+        '# Place user hook code in post-receive-user and it will be called from here.\n'
+        'curl -s $url\n'
+        '\n'
+        'DIR="$$(dirname "$${BASH_SOURCE[0]}")"\n'
+        'if [ -x $$DIR/post-receive-user ]; then\n'
+        '  exec $$DIR/post-receive-user\n'
+        'fi')
 
     def __init__(self, repo):
         self._repo = repo
@@ -62,7 +69,7 @@ class GitImplementation(M.RepositoryImplementation):
     @LazyProperty
     def _git(self):
         try:
-            return git.Repo(self._repo.full_fs_path)
+            return git.Repo(self._repo.full_fs_path, odbt=git.GitCmdObjectDB)
         except (git.exc.NoSuchPathError, git.exc.InvalidGitRepositoryError), err:
             log.error('Problem looking up repo: %r', err)
             return None
@@ -82,7 +89,7 @@ class GitImplementation(M.RepositoryImplementation):
         self._setup_special_files()
         self._repo.status = 'ready'
 
-    def clone_from(self, source_url):
+    def clone_from(self, source_url, copy_hooks=False):
         '''Initialize a repo as a clone of another'''
         self._repo.status = 'cloning'
         session(self._repo).flush(self._repo)
@@ -97,7 +104,7 @@ class GitImplementation(M.RepositoryImplementation):
                 to_path=fullname,
                 bare=True)
             self.__dict__['_git'] = repo
-            self._setup_special_files()
+            self._setup_special_files(source_url, copy_hooks)
         except:
             self._repo.status = 'ready'
             session(self._repo).flush(self._repo)
@@ -184,13 +191,11 @@ class GitImplementation(M.RepositoryImplementation):
             committed = Object(
                 name=h.really_unicode(ci.committer.name),
                 email=h.really_unicode(ci.committer.email),
-                date=datetime.utcfromtimestamp(
-                    ci.committed_date-ci.committer_tz_offset)),
+                date=datetime.utcfromtimestamp(ci.committed_date)),
             authored = Object(
                 name=h.really_unicode(ci.author.name),
                 email=h.really_unicode(ci.author.email),
-                date=datetime.utcfromtimestamp(
-                    ci.authored_date-ci.author_tz_offset)),
+                date=datetime.utcfromtimestamp(ci.authored_date)),
             message=h.really_unicode(ci.message or ''),
             child_ids=[],
             parent_ids = [ p.hexsha for p in ci.parents ])
@@ -228,6 +233,7 @@ class GitImplementation(M.RepositoryImplementation):
                 obj.type = o.type
                 doc.other_ids.append(obj)
         doc.m.save(safe=False)
+        return doc
 
     def log(self, object_id, skip, count):
         obj = self._git.commit(object_id)
@@ -254,8 +260,22 @@ class GitImplementation(M.RepositoryImplementation):
     def blob_size(self, blob):
         return self._object(blob._id).data_stream.size
 
-    def _setup_hooks(self):
+    def _copy_hooks(self, source_path):
+        '''Copy existing hooks if source path is given and exists.'''
+        if source_path is None or not os.path.exists(source_path):
+            return
+        for hook in glob(os.path.join(source_path, 'hooks/*')):
+            filename = os.path.basename(hook)
+            target_filename = filename
+            if filename == 'post-receive':
+                target_filename = 'post-receive-user'
+            target = os.path.join(self._repo.full_fs_path, 'hooks', target_filename)
+            shutil.copy2(hook, target)
+
+    def _setup_hooks(self, source_path=None, copy_hooks=False):
         'Set up the git post-commit hook'
+        if copy_hooks:
+            self._copy_hooks(source_path)
         text = self.post_receive_template.substitute(
             url=tg.config.get('base_url', 'http://localhost:8080')
             + '/auth/refresh_repo' + self._repo.url())
@@ -277,6 +297,11 @@ class GitImplementation(M.RepositoryImplementation):
         containing_branches = self._git.git.branch(contains=commit._id)
         containing_branches = [br.strip(' *') for br in containing_branches.split('\n')]
         return containing_branches, tags
+
+    def compute_tree_new(self, commit, tree_path='/'):
+        ci = self._git.rev_parse(commit._id)
+        tree = self.refresh_tree_info(ci.tree, set())
+        return tree._id
 
 class _OpenedGitBlob(object):
     CHUNK_SIZE=4096

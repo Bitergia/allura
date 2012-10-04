@@ -4,14 +4,15 @@ Model tests for artifact
 """
 from cStringIO import StringIO
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from cgi import FieldStorage
 
 from pylons import c, g, request, response
 from nose.tools import assert_raises, assert_equals, with_setup
 import mock
+from mock import patch
 
-from ming.orm.ormsession import ThreadLocalORMSession
+from ming.orm import session, ThreadLocalORMSession
 from webob import Request, Response, exc
 
 from allura import model as M
@@ -57,7 +58,7 @@ def test_discussion_methods():
 @with_setup(setUp, tearDown)
 def test_thread_methods():
     d = M.Discussion(shortname='test', name='test')
-    t = M.Thread(discussion_id=d._id, subject='Test Thread')
+    t = M.Thread.new(discussion_id=d._id, subject='Test Thread')
     assert t.discussion_class() == M.Discussion
     assert t.post_class() == M.Post
     assert t.attachment_class() == M.DiscussionAttachment
@@ -101,9 +102,26 @@ def test_thread_methods():
     t.delete()
 
 @with_setup(setUp, tearDown)
+def test_thread_new():
+    with mock.patch('allura.model.discuss.h.nonce') as nonce:
+        nonce.side_effect = ['deadbeef', 'deadbeef', 'beefdead']
+        d = M.Discussion(shortname='test', name='test')
+        t1 = M.Thread.new(discussion_id=d._id, subject='Test Thread One')
+        t2 = M.Thread.new(discussion_id=d._id, subject='Test Thread Two')
+        ThreadLocalORMSession.flush_all()
+        session(t1).expunge(t1)
+        session(t2).expunge(t2)
+        t1_2 = M.Thread.query.get(_id=t1._id)
+        t2_2 = M.Thread.query.get(_id=t2._id)
+        assert_equals(t1._id, 'deadbeef')
+        assert_equals(t2._id, 'beefdead')
+        assert_equals(t1_2.subject, 'Test Thread One')
+        assert_equals(t2_2.subject, 'Test Thread Two')
+
+@with_setup(setUp, tearDown)
 def test_post_methods():
     d = M.Discussion(shortname='test', name='test')
-    t = M.Thread(discussion_id=d._id, subject='Test Thread')
+    t = M.Thread.new(discussion_id=d._id, subject='Test Thread')
     p = t.post('This is a post')
     p2 = t.post('This is another post')
     assert p.discussion_class() == M.Discussion
@@ -137,7 +155,7 @@ def test_post_methods():
 @with_setup(setUp, tearDown)
 def test_attachment_methods():
     d = M.Discussion(shortname='test', name='test')
-    t = M.Thread(discussion_id=d._id, subject='Test Thread')
+    t = M.Thread.new(discussion_id=d._id, subject='Test Thread')
     p = t.post('This is a post')
     p_att = p.attach('foo.text', StringIO('Hello, world!'),
                 discussion_id=d._id,
@@ -158,7 +176,7 @@ def test_attachment_methods():
         assert 'attachment/' in att.url()
 
     # Test notification in mail
-    t = M.Thread(discussion_id=d._id, subject='Test comment notification')
+    t = M.Thread.new(discussion_id=d._id, subject='Test comment notification')
     fs = FieldStorage()
     fs.name='file_info'
     fs.filename='fake.txt'
@@ -172,19 +190,23 @@ def test_attachment_methods():
 @with_setup(setUp, tearDown)
 def test_discussion_delete():
     d = M.Discussion(shortname='test', name='test')
-    t = M.Thread(discussion_id=d._id, subject='Test Thread')
+    t = M.Thread.new(discussion_id=d._id, subject='Test Thread')
     p = t.post('This is a post')
     p.attach('foo.text', StringIO(''),
                 discussion_id=d._id,
                 thread_id=t._id,
                 post_id=p._id)
+    r = M.ArtifactReference.from_artifact(d)
+    rid = d.index_id()
     ThreadLocalORMSession.flush_all()
     d.delete()
+    ThreadLocalORMSession.flush_all()
+    assert_equals(M.ArtifactReference.query.find(dict(_id=rid)).count(), 0)
 
 @with_setup(setUp, tearDown)
 def test_thread_delete():
     d = M.Discussion(shortname='test', name='test')
-    t = M.Thread(discussion_id=d._id, subject='Test Thread')
+    t = M.Thread.new(discussion_id=d._id, subject='Test Thread')
     p = t.post('This is a post')
     p.attach('foo.text', StringIO(''),
                 discussion_id=d._id,
@@ -196,7 +218,7 @@ def test_thread_delete():
 @with_setup(setUp, tearDown)
 def test_post_delete():
     d = M.Discussion(shortname='test', name='test')
-    t = M.Thread(discussion_id=d._id, subject='Test Thread')
+    t = M.Thread.new(discussion_id=d._id, subject='Test Thread')
     p = t.post('This is a post')
     p.attach('foo.text', StringIO(''),
                 discussion_id=d._id,
@@ -208,7 +230,7 @@ def test_post_delete():
 @with_setup(setUp, tearDown)
 def test_post_permission_check():
     d = M.Discussion(shortname='test', name='test')
-    t = M.Thread(discussion_id=d._id, subject='Test Thread')
+    t = M.Thread.new(discussion_id=d._id, subject='Test Thread')
     c.user = M.User.anonymous()
     try:
         p1 = t.post('This post will fail the check.')
@@ -216,3 +238,75 @@ def test_post_permission_check():
     except exc.HTTPUnauthorized:
         pass
     p2 = t.post('This post will pass the check.', ignore_security=True)
+
+
+@with_setup(setUp, tearDown)
+def test_post_url_paginated():
+    d = M.Discussion(shortname='test', name='test')
+    t = M.Thread(discussion_id=d._id, subject='Test Thread')
+    p = []  # posts in display order
+    ts = datetime.utcnow() - timedelta(days=1)
+    for i in range(5):
+        ts += timedelta(minutes=1)
+        p.append(t.post('This is a post #%s' % i, timestamp=ts))
+
+    ts += timedelta(minutes=1)
+    p.insert(1, t.post(
+        'This is reply #0 to post #0', parent_id=p[0]._id, timestamp=ts))
+
+    ts += timedelta(minutes=1)
+    p.insert(2, t.post(
+        'This is reply #1 to post #0', parent_id=p[0]._id, timestamp=ts))
+
+    ts += timedelta(minutes=1)
+    p.insert(4, t.post(
+        'This is reply #0 to post #1', parent_id=p[3]._id, timestamp=ts))
+
+    ts += timedelta(minutes=1)
+    p.insert(6, t.post(
+        'This is reply #0 to post #2', parent_id=p[5]._id, timestamp=ts))
+
+    ts += timedelta(minutes=1)
+    p.insert(7, t.post(
+        'This is reply #1 to post #2', parent_id=p[5]._id, timestamp=ts))
+
+    ts += timedelta(minutes=1)
+    p.insert(8, t.post(
+        'This is reply #0 to reply #1 to post #2',
+        parent_id=p[7]._id, timestamp=ts))
+
+    # with default paging limit
+    for _p in p:
+        url = t.url() + '?limit=50#' + _p.slug
+        assert _p.url_paginated() == url, _p.url_paginated()
+
+    # with user paging limit
+    limit = 3
+    c.user.set_pref('results_per_page', limit)
+    for i, _p in enumerate(p):
+        page = i / limit
+        url = t.url() + '?limit=%s' % limit
+        if page > 0:
+            url += '&page=%s' % page
+        url += '#' + _p.slug
+        assert _p.url_paginated() == url, _p.url_paginated()
+
+
+@with_setup(setUp, tearDown)
+def test_post_notify():
+    d = M.Discussion(shortname='test', name='test')
+    d.monitoring_email = 'darthvader@deathstar.org'
+    t = M.Thread.new(discussion_id=d._id, subject='Test Thread')
+    with patch('allura.model.notification.Notification.send_simple') as send:
+        t.post('This is a post')
+        send.assert_called_with(d.monitoring_email)
+
+    c.app.config.project.notifications_disabled = True
+    with patch('allura.model.notification.Notification.send_simple') as send:
+        t.post('Another post')
+        try:
+            send.assert_called_with(d.monitoring_email)
+        except AssertionError:
+            pass  # method not called as expected
+        else:
+            assert False, 'send_simple must not be called'

@@ -26,8 +26,10 @@ from allura.controllers import AppDiscussionController
 from allura.lib.widgets.repo import SCMLogWidget, SCMRevisionWidget, SCMTreeWidget
 from allura.lib.widgets.repo import SCMMergeRequestWidget, SCMMergeRequestFilterWidget
 from allura.lib.widgets.repo import SCMMergeRequestDisposeWidget, SCMCommitBrowserWidget
+from allura.lib.widgets.subscriptions import SubscribeForm
 from allura import model as M
 from allura.lib.widgets import form_fields as ffw
+from allura.controllers.base import DispatchIndex
 
 from .base import BaseController
 
@@ -138,7 +140,7 @@ class RepoRootController(BaseController):
             M.Notification.post(
                 mr, 'merge_request',
                 subject='Merge request: ' + mr.summary)
-            t = M.Thread(
+            t = M.Thread.new(
                 discussion_id=c.app.config.discussion_id,
                 artifact_reference=mr.index_id(),
                 subject='Discussion for Merge Request #:%s: %s' % (
@@ -422,14 +424,16 @@ class CommitBrowser(BaseController):
 
     @expose('jinja:allura:templates/repo/log.html')
     @with_trailing_slash
-    def log(self, limit=None, page=0, count=0, **kw):
-        limit, page, start = g.handle_paging(limit, page)
+    @validate(dict(page=validators.Int(if_empty=0),
+                   limit=validators.Int(if_empty=25)))
+    def log(self, limit=25, page=0, **kw):
+        limit, page, start = g.handle_paging(limit, page, default=25)
         revisions = c.app.repo.log(
                 branch=self._commit._id,
                 offset=start,
                 limit=limit)
+        count = c.app.repo.count(branch=self._commit._id)
         c.log_widget = self.log_widget
-        count = 0
         return dict(
             username=c.user._id and c.user.username,
             branch=None,
@@ -439,9 +443,10 @@ class CommitBrowser(BaseController):
             count=count,
             **kw)
 
-class TreeBrowser(BaseController):
+class TreeBrowser(BaseController, DispatchIndex):
     tree_widget = SCMTreeWidget()
     FileBrowserClass=None
+    subscribe_form = SubscribeForm()
 
     def __init__(self, commit, tree, path='', parent=None):
         self._commit = commit
@@ -453,12 +458,15 @@ class TreeBrowser(BaseController):
     @with_trailing_slash
     def index(self, **kw):
         c.tree_widget = self.tree_widget
+        c.subscribe_form = self.subscribe_form
+        tool_subscribed = M.Mailbox.subscribed()
         return dict(
             repo=c.app.repo,
             commit=self._commit,
             tree=self._tree,
             path=self._path,
-            parent=self._parent)
+            parent=self._parent,
+            tool_subscribed=tool_subscribed)
 
     @expose()
     def _lookup(self, next, *rest):
@@ -494,6 +502,16 @@ class TreeBrowser(BaseController):
             tree,
             self._path + '/' + next,
             self), rest
+
+    @expose()
+    @validate(subscribe_form)
+    def subscribe(self, subscribe=None, unsubscribe=None):
+        if subscribe:
+            M.Mailbox.subscribe()
+        elif unsubscribe:
+            M.Mailbox.unsubscribe()
+        redirect(request.referer)
+
 
 class FileBrowser(BaseController):
 

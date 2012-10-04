@@ -17,6 +17,7 @@ from allura.lib.repository import RepositoryApp, RepoAdminController
 from allura.app import SitemapEntry, ConfigOption
 from allura.lib import helpers as h
 from allura import model as M
+from allura.lib.utils import svn_path_exists
 
 # Local imports
 from . import model as SM
@@ -61,11 +62,13 @@ class ForgeSVNApp(RepositoryApp):
             status='initializing')
         ThreadLocalORMSession.flush_all()
         init_from_url = self.config.options.get('init_from_url')
-        if init_from_url:
+        init_from_path = self.config.options.get('init_from_path')
+        if init_from_url or init_from_path:
             allura.tasks.repo_tasks.clone.post(
-                cloned_from_path=None,
+                cloned_from_path=init_from_path,
                 cloned_from_name=None,
-                cloned_from_url=init_from_url)
+                cloned_from_url=init_from_url,
+                copy_hook=self.config.options.get('copy_hooks', False))
         else:
             allura.tasks.repo_tasks.init.post()
 
@@ -97,7 +100,15 @@ class SVNRepoAdminController(RepoAdminController):
     @expose()
     @require_post()
     def set_checkout_url(self, **post_data):
-        self.app.config.options['checkout_url'] = post_data['checkout_url']
+        if svn_path_exists("file://%s%s/%s" %
+                          (self.app.repo.fs_path,
+                           self.app.repo.name,
+                           post_data['checkout_url'])):
+            self.app.config.options['checkout_url'] = post_data['checkout_url']
+            flash("Checkout URL successfully changed")
+        else:
+            flash("%s is not a valid path for this repository" % post_data['checkout_url'], "error")
+
 
 class SVNImportController(BaseController):
     import_form=widgets.ImportForm()

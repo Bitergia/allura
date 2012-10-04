@@ -2,7 +2,7 @@ import unittest
 from datetime import timedelta
 
 from pylons import g, c
-from nose.tools import assert_equal
+from nose.tools import assert_equal, assert_in
 from ming.orm import ThreadLocalORMSession
 
 from alluratest.controller import setup_basic_test, setup_global_objects, REGISTRY
@@ -96,28 +96,36 @@ class TestPostNotifications(unittest.TestCase):
         assert M.Mailbox.query.find().count()==1
         mbox = M.Mailbox.query.get()
         assert len(mbox.queue) == 1
+        assert not mbox.queue_empty
 
     def test_email(self):
-        self._subscribe()
+        self._subscribe()  # as current user: test-admin
+        user2 = M.User.query.get(username='test-user-2')
+        self._subscribe(user=user2)
         self._post_notification()
         ThreadLocalORMSession.flush_all()
 
         assert_equal(M.Notification.query.get()['from_address'], '"Test Admin" <test-admin@users.localhost>')
-        assert M.Mailbox.query.find().count()==1
+        assert_equal(M.Mailbox.query.find().count(), 2)
 
-        M.MonQTask.run_ready()  # sends the notification out into "mailboxes"
-        assert_equal(M.Notification.query.get(), None)
-        mbox = M.Mailbox.query.get()
-        assert len(mbox.queue) == 1
+        M.MonQTask.run_ready()  # sends the notification out into "mailboxes", and from mailboxes into email tasks
+        mboxes = M.Mailbox.query.find().all()
+        assert_equal(len(mboxes), 2)
+        assert_equal(len(mboxes[0].queue), 1)
+        assert not mboxes[0].queue_empty
+        assert_equal(len(mboxes[1].queue), 1)
+        assert not mboxes[1].queue_empty
 
-        M.Mailbox.fire_ready()
-        task = M.MonQTask.get()
-        for addr in c.user.email_addresses:
-            if addr in task.kwargs['fromaddr']: break
-        else:
-            assert False, 'From address is wrong: %s' % task.kwargs['fromaddr']
-        assert task.kwargs['text'].startswith('WikiPage Home modified by Test Admin')
-        assert 'you indicated interest in ' in task.kwargs['text']
+        email_tasks = M.MonQTask.query.find({'state': 'ready'}).all()
+        assert_equal(len(email_tasks), 2)  # make sure both subscribers will get an email
+
+        first_destinations = [e.kwargs['destinations'][0] for e in email_tasks]
+        assert_in(str(c.user._id), first_destinations)
+        assert_in(str(user2._id), first_destinations)
+        assert_equal(email_tasks[0].kwargs['fromaddr'], '"Test Admin" <test-admin@users.localhost>')
+        assert_equal(email_tasks[1].kwargs['fromaddr'], '"Test Admin" <test-admin@users.localhost>')
+        assert email_tasks[0].kwargs['text'].startswith('WikiPage Home modified by Test Admin')
+        assert 'you indicated interest in ' in email_tasks[0].kwargs['text']
 
     def test_permissions(self):
         # Notification should only be delivered if user has read perms on the
@@ -194,10 +202,13 @@ class TestSubscriptionTypes(unittest.TestCase):
 
     def test_message(self):
         self._test_message()
+
         self.setUp()
         self._test_message()
+
         self.setUp()
         M.notification.MAILBOX_QUIESCENT=timedelta(minutes=1)
+        # will raise "assert msg is not None" since the new message is not 1 min old:
         self.assertRaises(AssertionError, self._test_message)
 
     def _test_message(self):

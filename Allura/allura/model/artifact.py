@@ -262,7 +262,7 @@ class Artifact(MappedClass):
         t = Thread.query.get(ref_id=self.index_id())
         if t is None:
             idx = self.index()
-            t = Thread(
+            t = Thread.new(
                 discussion_id=self.app_config.discussion_id,
                 ref_id=idx['id'],
                 subject='%s discussion' % idx['title_s'])
@@ -282,6 +282,10 @@ class Artifact(MappedClass):
             filename=filename,
             fp=fp, artifact_id=self._id, **kw)
         return att
+
+    def delete(self):
+        ArtifactReference.query.remove(dict(_id=self.index_id()))
+        super(Artifact, self).delete()
 
 class Snapshot(Artifact):
     """A snapshot of an :class:`Artifact <allura.model.artifact.Artifact>`, used in :class:`VersionedArtifact <allura.model.artifact.VersionedArtifact>`"""

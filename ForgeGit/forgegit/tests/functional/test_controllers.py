@@ -36,6 +36,20 @@ class _TestCase(TestController):
         ThreadLocalORMSession.flush_all()
         # ThreadLocalORMSession.close_all()
 
+    @td.with_tool('test', 'Git', 'testgit-index', 'Git', type='git')
+    def setup_testgit_index_repo(self):
+        h.set_context('test', 'testgit-index', neighborhood='Projects')
+        repo_dir = pkg_resources.resource_filename(
+            'forgegit', 'tests/data')
+        c.app.repo.fs_path = repo_dir
+        c.app.repo.status = 'ready'
+        c.app.repo.name = 'testgit_index.git'
+        ThreadLocalORMSession.flush_all()
+        h.set_context('test', 'testgit-index', neighborhood='Projects')
+        c.app.repo.refresh()
+        ThreadLocalORMSession.flush_all()
+
+
 class TestRootController(_TestCase):
 
     def test_status(self):
@@ -148,6 +162,73 @@ class TestRootController(_TestCase):
         content = str(resp.html.find('div', {'class':'clip grid-19'}))
         assert re.search(r'<pre>.*This is readme', content), content
         assert '</pre>' in content, content
+
+    def test_index_files(self):
+        """Test that `index.*` files are viewable in code browser"""
+        self.setup_testgit_index_repo()
+        ci = '/p/test/testgit-index/ci/eaec8e7fc91f18d6bf294379d16146ef9226a1ab/'
+
+        # `index.html` in repo root
+        r = self.app.get(ci + 'tree/index.html')
+        header = r.html.find('h2', {'class': 'dark title'}).contents[2]
+        assert 'index.html' in header, header
+        content = str(r.html.find('div', {'class': 'clip grid-19'}))
+        assert ('<span class="nt">&lt;h1&gt;</span>'
+                'index.html'
+                '<span class="nt">&lt;/h1&gt;</span>') in content, content
+
+        # `index` dir in repo root
+        r = self.app.get(ci + 'tree/index/')
+        assert 'inside_index_dir.txt' in r
+
+        # `index.htm` in `index` dir
+        r = self.app.get(ci + 'tree/index/index.htm')
+        header = r.html.find('h2', {'class': 'dark title'})
+        assert 'index' in header.contents[3], header.contents[3]
+        assert 'index.htm' in header.contents[4], header.contents[4]
+        content = str(r.html.find('div', {'class': 'clip grid-19'}))
+        assert ('<span class="nt">&lt;h1&gt;</span>'
+                'index/index.htm'
+                '<span class="nt">&lt;/h1&gt;</span>') in content, content
+
+    def test_subscribe(self):
+        user = M.User.query.get(username='test-user')
+        ci = self._get_ci()
+
+        # user is not subscribed
+        assert not M.Mailbox.subscribed(user_id=user._id)
+        r = self.app.get(ci + 'tree/',
+                extra_environ={'username': str(user.username)})
+        header = r.html.find('h2', {'class': 'dark title'})
+        link = header.find('a', {'class': 'artifact_subscribe'})
+        assert link is not None, header
+
+        # subscribe
+        self.app.get(ci + 'tree/subscribe?subscribe=True',
+                extra_environ={'username': str(user.username)}).follow()
+        # user is subscribed
+        assert M.Mailbox.subscribed(user_id=user._id)
+        r = self.app.get(ci + 'tree/',
+                extra_environ={'username': str(user.username)})
+        header = r.html.find('h2', {'class': 'dark title'})
+        link = header.find('a', {'class': 'artifact_unsubscribe active'})
+        assert link is not None, header
+
+        # unsubscribe
+        self.app.get(ci + 'tree/subscribe?unsubscribe=True',
+                extra_environ={'username': str(user.username)}).follow()
+        # user is not subscribed
+        assert not M.Mailbox.subscribed(user_id=user._id)
+        r = self.app.get(ci + 'tree/',
+                extra_environ={'username': str(user.username)})
+        header = r.html.find('h2', {'class': 'dark title'})
+        link = header.find('a', {'class': 'artifact_subscribe'})
+        assert link is not None, header
+
+    def test_timezone(self):
+        ci = self._get_ci()
+        resp = self.app.get(ci + 'tree/')
+        assert "Thu Oct 07, 2010 06:44 PM UTC" in resp, resp.showbrowser()
 
 
 class TestRestController(_TestCase):

@@ -42,14 +42,9 @@ class Command(command.Command):
         if self.args[0]:
             # Probably being called from the command line - load the config file
             self.config = conf = appconfig('config:%s' % self.args[0],relative_to=os.getcwd())
-            # Configure logging
-            try:
-                # ... logging does not understand section#subsection syntax
-                logging_config = self.args[0].split('#')[0]
-                logging.config.fileConfig(logging_config, disable_existing_loggers=False)
-            except Exception: # pragma no cover
-                print >> sys.stderr, (
-                    'Could not configure logging with config file %s' % self.args[0])
+            # ... logging does not understand section#subsection syntax
+            logging_config = self.args[0].split('#')[0]
+            logging.config.fileConfig(logging_config, disable_existing_loggers=False)
             log = logging.getLogger('allura.command')
             log.info('Initialize command with config %r', self.args[0])
             load_environment(conf.global_conf, conf.local_conf)
@@ -80,21 +75,3 @@ class Command(command.Command):
     def teardown_globals(self):
         self.registry.cleanup()
 
-class RestartableProcess(object):
-
-    def __init__(self, log, *args, **kwargs):
-        self._log = log
-        self._args, self._kwargs = args, kwargs
-        self.reinit()
-
-    def reinit(self):
-        self._process = Process(*self._args, **self._kwargs)
-
-    def check(self):
-        if not self.is_alive():
-            self._log.error('Process %d has died, restarting', self.pid)
-            self.reinit()
-            self.start()
-
-    def __getattr__(self, name):
-        return getattr(self._process, name)

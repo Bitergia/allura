@@ -13,7 +13,6 @@ Periodically:
    - Enqueue one email message with all notifications
    - Clear subscription's notification list
 
-Notifications are also available for use in feeds
 '''
 
 import logging
@@ -32,6 +31,7 @@ from ming.orm.declarative import MappedClass
 
 from allura.lib import helpers as h
 from allura.lib import security
+from allura.lib.utils import take_while_true
 import allura.tasks.mail_tasks
 
 from .session import main_orm_session, project_orm_session
@@ -45,6 +45,7 @@ MAILBOX_QUIESCENT=None # Re-enable with [#1384]: timedelta(minutes=10)
 class Notification(MappedClass):
     '''
     Temporarily store notifications that will be emailed or displayed as a web flash.
+    This does not contain any recipient information.
     '''
 
     class __mongometa__:
@@ -103,10 +104,16 @@ class Notification(MappedClass):
         n = cls._make_notification(artifact, topic, **kw)
         if n:
             mbox.queue.append(n._id)
+            mbox.queue_empty = False
         return n
 
     @classmethod
     def _make_notification(cls, artifact, topic, **kwargs):
+        '''
+        Create a Notification instance based on an artifact.  Special handling
+        for comments when topic=='message'
+        '''
+
         from allura.model import Project
         idx = artifact.index()
         subject_prefix = '[%s:%s] ' % (
@@ -268,7 +275,14 @@ class Notification(MappedClass):
             message_id=h.gen_message_id(),
             text=text)
 
+
 class Mailbox(MappedClass):
+    '''
+    Holds a queue of notifications for an artifact, or a user (webflash messages)
+    for a subscriber.
+    FIXME: describe the Mailbox concept better.
+    '''
+
     class __mongometa__:
         session = main_orm_session
         name = 'mailbox'
@@ -279,7 +293,9 @@ class Mailbox(MappedClass):
         indexes = [
             ('project_id', 'artifact_index_id'),
             ('is_flash', 'user_id'),
-            ('type', 'next_scheduled')]
+            ('type', 'next_scheduled'),  # for q_digest
+            ('type', 'queue_empty'),  # for q_direct
+        ]
 
     _id = FieldProperty(S.ObjectId)
     user_id = ForeignIdProperty('User', if_missing=lambda:c.user._id)
@@ -298,10 +314,11 @@ class Mailbox(MappedClass):
     frequency = FieldProperty(dict(
             n=int,unit=S.OneOf('day', 'week', 'month')))
     next_scheduled = FieldProperty(datetime, if_missing=datetime.utcnow)
-
-    # Actual notification IDs
     last_modified = FieldProperty(datetime, if_missing=datetime(2000,1,1))
+
+    # a list of notification _id values
     queue = FieldProperty([str])
+    queue_empty = FieldProperty(bool)
 
     project = RelationProperty('Project')
     app_config = RelationProperty('AppConfig')
@@ -399,7 +416,7 @@ class Mailbox(MappedClass):
     @classmethod
     def deliver(cls, nid, artifact_index_id, topic):
         '''Called in the notification message handler to deliver notification IDs
-        to the appropriate  mailboxes.  Atomically appends the nids
+        to the appropriate mailboxes.  Atomically appends the nids
         to the appropriate mailboxes.
         '''
         d = {
@@ -411,32 +428,42 @@ class Mailbox(MappedClass):
         for mbox in cls.query.find(d):
             mbox.query.update(
                 {'$push':dict(queue=nid),
-                 '$set':dict(last_modified=datetime.utcnow())})
+                 '$set':dict(last_modified=datetime.utcnow(),
+                             queue_empty=False),
+                })
             # Make sure the mbox doesn't stick around to be flush()ed
             session(mbox).expunge(mbox)
 
     @classmethod
     def fire_ready(cls):
         '''Fires all direct subscriptions with notifications as well as
-        all summary & digest subscriptions with notifications that are ready
+        all summary & digest subscriptions with notifications that are ready.
+        Clears the mailbox queue.
         '''
         now = datetime.utcnow()
         # Queries to find all matching subscription objects
         q_direct = dict(
             type='direct',
-            queue={'$ne':[]})
+            queue_empty=False,
+        )
         if MAILBOX_QUIESCENT:
             q_direct['last_modified']={'$lt':now - MAILBOX_QUIESCENT}
         q_digest = dict(
             type={'$in': ['digest', 'summary']},
             next_scheduled={'$lt':now})
-        for mbox in cls.query.find(q_direct):
-            mbox = cls.query.find_and_modify(
-                query=dict(_id=mbox._id),
+
+        def find_and_modify_direct_mbox():
+            return cls.query.find_and_modify(
+                query=q_direct,
                 update={'$set': dict(
-                        queue=[])},
+                            queue=[],
+                            queue_empty=True,
+                        )},
                 new=False)
+
+        for mbox in take_while_true(find_and_modify_direct_mbox):
             mbox.fire(now)
+
         for mbox in cls.query.find(q_digest):
             next_scheduled = now
             if mbox.frequency.unit == 'day':
@@ -449,11 +476,16 @@ class Mailbox(MappedClass):
                 query=dict(_id=mbox._id),
                 update={'$set': dict(
                         next_scheduled=next_scheduled,
-                        queue=[])},
+                        queue=[],
+                        queue_empty=True,
+                        )},
                 new=False)
             mbox.fire(now)
 
     def fire(self, now):
+        '''
+        Send all notifications that this mailbox has enqueued.
+        '''
         notifications = Notification.query.find(dict(_id={'$in':self.queue}))
         notifications = notifications.all()
         if self.type == 'direct':
@@ -481,5 +513,3 @@ class Mailbox(MappedClass):
             Notification.send_summary(
                 self.user_id, u'noreply@in.sf.net', 'Digest Email',
                 notifications)
-        # remove Notifications since they are no longer needed
-        Notification.query.remove({'_id': {'$in': [n._id for n in notifications]}})
